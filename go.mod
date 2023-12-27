@@ -1,4 +1,4 @@
-module github.com/minio/pkg/v2
+module github.com/mixer904/minio-pkg
 
 go 1.19
 
