@@ -1,4 +1,4 @@
-module github.com/minio/pkg/v3
+module github.com/mixer904/minio-pkg
 
 go 1.21
 
