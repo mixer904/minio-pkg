@@ -21,6 +21,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/pires/go-proxyproto"
 	"net"
 	"strconv"
 	"time"
@@ -169,7 +170,8 @@ func (s *Server) Listen() (err error) {
 	)
 
 	for {
-		conn, err := s.listener.Accept()
+		proxyList := proxyproto.Listener{Listener: s.listener}
+		conn, err := proxyList.Accept()
 		if s.beforeHandle != nil && !s.beforeHandle(conn, err) {
 			if conn != nil {
 				conn.Close()

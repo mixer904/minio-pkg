@@ -14,6 +14,7 @@ require (
 	github.com/minio/minio-go/v7 v7.0.70
 	github.com/minio/mux v1.8.2
 	github.com/montanaflynn/stats v0.7.1
+	github.com/pires/go-proxyproto v0.7.0
 	github.com/rjeczalik/notify v0.9.3
 	go.etcd.io/etcd/client/v3 v3.5.13
 	golang.org/x/crypto v0.23.0
