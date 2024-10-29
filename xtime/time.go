@@ -18,7 +18,11 @@
 package xtime
 
 import (
+	"fmt"
 	"time"
+
+	"github.com/tinylib/msgp/msgp"
+	"gopkg.in/yaml.v3"
 )
 
 // Additional durations, a day is considered to be 24 hours
@@ -52,4 +56,74 @@ func ParseDuration(s string) (time.Duration, error) {
 		return dur, nil
 	}
 	return parseDuration(s)
+}
+
+// Duration is a wrapper around time.Duration that supports YAML and JSON
+type Duration time.Duration
+
+// D will return as a time.Duration.
+func (d Duration) D() time.Duration {
+	return time.Duration(d)
+}
+
+// UnmarshalYAML implements yaml.Unmarshaler
+func (d *Duration) UnmarshalYAML(value *yaml.Node) error {
+	if value.Kind == yaml.ScalarNode {
+		dur, err := ParseDuration(value.Value)
+		if err != nil {
+			return err
+		}
+		*d = Duration(dur)
+		return nil
+	}
+	return fmt.Errorf("unable to unmarshal %s", value.Tag)
+}
+
+// UnmarshalJSON implements json.Unmarshaler
+func (d *Duration) UnmarshalJSON(bs []byte) error {
+	if len(bs) <= 2 {
+		return nil
+	}
+	dur, err := ParseDuration(string(bs[1 : len(bs)-1]))
+	if err != nil {
+		return err
+	}
+	*d = Duration(dur)
+	return nil
+}
+
+// MarshalMsg appends the marshaled form of the object to the provided
+// byte slice, returning the extended slice and any errors encountered.
+func (d Duration) MarshalMsg(bytes []byte) ([]byte, error) {
+	return msgp.AppendInt64(bytes, int64(d)), nil
+}
+
+// UnmarshalMsg unmarshals the object from binary,
+// returing any leftover bytes and any errors encountered.
+func (d *Duration) UnmarshalMsg(b []byte) ([]byte, error) {
+	i, rem, err := msgp.ReadInt64Bytes(b)
+	*d = Duration(i)
+	return rem, err
+}
+
+// EncodeMsg writes itself as MessagePack using a *msgp.Writer.
+func (d Duration) EncodeMsg(w *msgp.Writer) error {
+	return w.WriteInt64(int64(d))
+}
+
+// DecodeMsg decodes itself as MessagePack using a *msgp.Reader.
+func (d *Duration) DecodeMsg(reader *msgp.Reader) error {
+	i, err := reader.ReadInt64()
+	*d = Duration(i)
+	return err
+}
+
+// Msgsize returns the maximum serialized size in bytes.
+func (d Duration) Msgsize() int {
+	return msgp.Int64Size
+}
+
+// MarshalYAML implements yaml.Marshaler - Converts duration to human-readable format (e.g., "2h", "30m")
+func (d Duration) MarshalYAML() (interface{}, error) {
+	return time.Duration(d).String(), nil
 }
