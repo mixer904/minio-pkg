@@ -18,19 +18,27 @@
 package policy
 
 import (
+	"bytes"
 	"strings"
+	"sync"
 
 	"github.com/minio/pkg/v3/policy/condition"
 )
 
 // Statement - iam policy statement.
 type Statement struct {
-	SID        ID                  `json:"Sid,omitempty"`
-	Effect     Effect              `json:"Effect"`
-	Actions    ActionSet           `json:"Action"`
-	NotActions ActionSet           `json:"NotAction,omitempty"`
-	Resources  ResourceSet         `json:"Resource,omitempty"`
-	Conditions condition.Functions `json:"Condition,omitempty"`
+	SID          ID                  `json:"Sid,omitempty"`
+	Effect       Effect              `json:"Effect"`
+	Actions      ActionSet           `json:"Action"`
+	NotActions   ActionSet           `json:"NotAction,omitempty"`
+	Resources    ResourceSet         `json:"Resource,omitempty"`
+	NotResources ResourceSet         `json:"NotResource,omitempty"`
+	Conditions   condition.Functions `json:"Condition,omitempty"`
+}
+
+// smallBufPool should always return a non-nil *bytes.Buffer
+var smallBufPool = sync.Pool{
+	New: func() interface{} { return &bytes.Buffer{} },
 }
 
 // IsAllowed - checks given policy args is allowed to continue the Rest API.
@@ -40,20 +48,23 @@ func (statement Statement) IsAllowed(args Args) bool {
 			statement.NotActions.Match(args.Action) {
 			return false
 		}
+		resource := smallBufPool.Get().(*bytes.Buffer)
+		defer smallBufPool.Put(resource)
+		resource.Reset()
 
-		resource := args.BucketName
+		resource.WriteString(args.BucketName)
 		if args.ObjectName != "" {
 			if !strings.HasPrefix(args.ObjectName, "/") {
-				resource += "/"
+				resource.WriteByte('/')
 			}
 
-			resource += args.ObjectName
+			resource.WriteString(args.ObjectName)
 		} else {
-			resource += "/"
+			resource.WriteByte('/')
 		}
 
 		if statement.isKMS() {
-			if resource == "/" || len(statement.Resources) == 0 {
+			if resource.Len() == 1 && resource.String() == "/" || len(statement.Resources) == 0 {
 				// In previous MinIO versions, KMS statements ignored Resources, so if len(statement.Resources) == 0,
 				// allow backward compatibility by not trying to Match.
 
@@ -65,7 +76,13 @@ func (statement Statement) IsAllowed(args Args) bool {
 		}
 
 		// For some admin statements, resource match can be ignored.
-		if !statement.Resources.Match(resource, args.ConditionValues) && !statement.isAdmin() && !statement.isSTS() {
+		ignoreResourceMatch := statement.isAdmin() || statement.isSTS()
+
+		if !ignoreResourceMatch && len(statement.Resources) > 0 && !statement.Resources.Match(resource.String(), args.ConditionValues) {
+			return false
+		}
+
+		if !ignoreResourceMatch && len(statement.NotResources) > 0 && statement.NotResources.Match(resource.String(), args.ConditionValues) {
 			return false
 		}
 
@@ -112,6 +129,10 @@ func (statement Statement) isValid() error {
 		return Errorf("Action must not be empty")
 	}
 
+	if len(statement.Actions) > 0 && len(statement.NotActions) > 0 {
+		return Errorf("Action and NotAction cannot be specified in the same statement")
+	}
+
 	if statement.isAdmin() {
 		if err := statement.Actions.ValidateAdmin(); err != nil {
 			return err
@@ -144,18 +165,32 @@ func (statement Statement) isValid() error {
 		if err := statement.Actions.ValidateKMS(); err != nil {
 			return err
 		}
-		return statement.Resources.ValidateKMS()
+		if err := statement.Resources.ValidateKMS(); err != nil {
+			return err
+		}
+		if err := statement.NotResources.ValidateKMS(); err != nil {
+			return err
+		}
+		return nil
 	}
 
 	if !statement.SID.IsValid() {
 		return Errorf("invalid SID %v", statement.SID)
 	}
 
-	if len(statement.Resources) == 0 {
+	if len(statement.Resources) == 0 && len(statement.NotResources) == 0 {
 		return Errorf("Resource must not be empty")
 	}
 
+	if len(statement.Resources) > 0 && len(statement.NotResources) > 0 {
+		return Errorf("Resource and NotResource cannot be specified in the same statement")
+	}
+
 	if err := statement.Resources.ValidateS3(); err != nil {
+		return err
+	}
+
+	if err := statement.NotResources.ValidateS3(); err != nil {
 		return err
 	}
 
@@ -164,8 +199,11 @@ func (statement Statement) isValid() error {
 	}
 
 	for action := range statement.Actions {
-		if !statement.Resources.ObjectResourceExists() && !statement.Resources.BucketResourceExists() {
+		if len(statement.Resources) > 0 && !statement.Resources.ObjectResourceExists() && !statement.Resources.BucketResourceExists() {
 			return Errorf("unsupported Resource found %v for action %v", statement.Resources, action)
+		}
+		if len(statement.NotResources) > 0 && !statement.NotResources.ObjectResourceExists() && !statement.NotResources.BucketResourceExists() {
+			return Errorf("unsupported NotResource found %v for action %v", statement.NotResources, action)
 		}
 
 		keys := statement.Conditions.Keys()
@@ -197,6 +235,9 @@ func (statement Statement) Equals(st Statement) bool {
 	if !statement.Resources.Equals(st.Resources) {
 		return false
 	}
+	if !statement.NotResources.Equals(st.NotResources) {
+		return false
+	}
 	if !statement.Conditions.Equals(st.Conditions) {
 		return false
 	}
@@ -206,12 +247,13 @@ func (statement Statement) Equals(st Statement) bool {
 // Clone clones Statement structure
 func (statement Statement) Clone() Statement {
 	return Statement{
-		SID:        statement.SID,
-		Effect:     statement.Effect,
-		Actions:    statement.Actions.Clone(),
-		NotActions: statement.NotActions.Clone(),
-		Resources:  statement.Resources.Clone(),
-		Conditions: statement.Conditions.Clone(),
+		SID:          statement.SID,
+		Effect:       statement.Effect,
+		Actions:      statement.Actions.Clone(),
+		NotActions:   statement.NotActions.Clone(),
+		Resources:    statement.Resources.Clone(),
+		NotResources: statement.NotResources.Clone(),
+		Conditions:   statement.Conditions.Clone(),
 	}
 }
 
@@ -223,6 +265,17 @@ func NewStatement(sid ID, effect Effect, actionSet ActionSet, resourceSet Resour
 		Actions:    actionSet,
 		Resources:  resourceSet,
 		Conditions: conditions,
+	}
+}
+
+// NewStatementWithNotResource - creates new statement with NotAction.
+func NewStatementWithNotResource(sid ID, effect Effect, actions ActionSet, notResources ResourceSet, conditions condition.Functions) Statement {
+	return Statement{
+		SID:          sid,
+		Effect:       effect,
+		Actions:      actions,
+		NotResources: notResources,
+		Conditions:   conditions,
 	}
 }
 

@@ -15,48 +15,32 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-package randreader
+//+build !noasm
+//+build !appengine
+//+build !gccgo
 
-import (
-	"io"
-	"math/rand"
-	"testing"
-)
+// func xorSlice(in, out []byte, v *[4]uint64)
+TEXT ·xorSlice(SB), 7, $0
+	MOVQ  v+48(FP), AX         // AX: v
+	MOVQ  in+0(FP), SI         // SI: &in
+	MOVQ  out+24(FP), DX       // DX: &out
+	MOVQ  out_len+32(FP), R9   // R9: len(out)
+	MOVOU (AX), X0             // v[x]
+	MOVOU 16(AX), X1           // v[x+2]
+	SHRQ  $5, R9               // len(in) / 32
+	JZ    done_xor_sse2_32
 
-func BenchmarkReader(b *testing.B) {
-	const size = 100000
+loopback_xor_sse2_32:
+	MOVOU (SI), X2             // in[x]
+	MOVOU 16(SI), X3           // in[x+16]
+	PXOR  X0, X2
+	PXOR  X1, X3
+	MOVOU X2, (DX)
+	MOVOU X3, 16(DX)
+	ADDQ  $32, SI              // in+=32
+	ADDQ  $32, DX              // out+=32
+	SUBQ  $1, R9
+	JNZ   loopback_xor_sse2_32
 
-	buf := make([]byte, size)
-	src := New()
-	b.SetBytes(size)
-	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		n, err := io.ReadFull(src, buf)
-		if err != nil {
-			b.Fatal(err)
-		}
-		if n != size {
-			b.Fatalf("want read size %d, got %d", size, n)
-		}
-	}
-}
-
-func BenchmarkMathRand(b *testing.B) {
-	const size = 100000
-
-	buf := make([]byte, size)
-	src := rand.New(rand.NewSource(0))
-	b.SetBytes(size)
-	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		n, err := io.ReadFull(src, buf)
-		if err != nil {
-			b.Fatal(err)
-		}
-		if n != size {
-			b.Fatalf("want read size %d, got %d", size, n)
-		}
-	}
-}
+done_xor_sse2_32:
+	RET

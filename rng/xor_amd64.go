@@ -15,30 +15,9 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-package randreader
+//go:build !noasm && !appengine && !gccgo
 
-import (
-	"io"
-	"math/rand"
-	"time"
+package rng
 
-	"github.com/minio/pkg/v3/rng"
-)
-
-// New returns an infinite reader that will return pseudo-random data.
-// Data should not be used for cryptographic functions.
-// A random time based seed is used.
-func New() io.Reader {
-	return NewSource(rand.NewSource(time.Now().UnixNano()))
-}
-
-// NewSource returns an infinite reader that will return pseudo-random data.
-// Data should not be used for cryptographic functions.
-// The data is seeded from the provided source.
-func NewSource(src rand.Source) io.Reader {
-	r, err := rng.NewReader(rng.WithRNG(rand.New(src)))
-	if err != nil {
-		panic(err)
-	}
-	return r
-}
+//go:noescape
+func xorSlice(in, out []byte, v *[4]uint64)
