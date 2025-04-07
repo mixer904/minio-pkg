@@ -204,6 +204,26 @@ const (
 	// CancelBatchJobAction allow canceling a batch job
 	CancelBatchJobAction = "admin:CancelBatchJob"
 
+	// GenerateBatchJobAction allow requesting batch job templates
+	GenerateBatchJobAction = "admin:GenerateBatchJob"
+
+	// All new v4 APIs
+
+	// ClusterInfoAction - allow cluster summary
+	ClusterInfoAction = "admin:ClusterInfo"
+
+	// PoolListAction - allow list how many pools and summary per pool
+	PoolListAction = "admin:PoolList"
+
+	// PoolInfoAction - allow pool specific summary and detail information
+	PoolInfoAction = "admin:PoolInfo"
+
+	// SetInfoAction - allow set specific summary and detail
+	SetInfoAction = "admin:SetInfo"
+
+	// DriveInfoAction - allow drive specific summary and detail
+	DriveInfoAction = "admin:DriveInfo"
+
 	// AllAdminActions - provides all admin permissions
 	AllAdminActions = "admin:*"
 )
