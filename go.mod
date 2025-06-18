@@ -2,7 +2,7 @@ module github.com/mixer904/minio-pkg
 
 go 1.23.0
 
-toolchain go1.23.6
+toolchain go1.24.4
 
 require (
 	github.com/cheggaaa/pb v1.0.29
