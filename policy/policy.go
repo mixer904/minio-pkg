@@ -1,4 +1,4 @@
-// Copyright (c) 2015-2021 MinIO, Inc.
+// Copyright (c) 2015-2025 MinIO, Inc.
 //
 // This file is part of MinIO Object Storage stack
 //
@@ -18,11 +18,17 @@
 package policy
 
 import (
+	"context"
+	"crypto/rand"
+	"encoding/binary"
 	"encoding/json"
 	"io"
+	"runtime"
 	"strings"
+	"sync"
 
 	"github.com/minio/minio-go/v7/pkg/set"
+	"github.com/minio/pkg/v3/wildcard"
 )
 
 // DefaultVersion - default policy version as per AWS S3 specification.
@@ -30,16 +36,16 @@ const DefaultVersion = "2012-10-17"
 
 // Args - arguments to policy to check whether it is allowed
 type Args struct {
-	AccountName     string                 `json:"account"`
-	Groups          []string               `json:"groups"`
-	Action          Action                 `json:"action"`
-	OriginalAction  Action                 `json:"originalAction"`
-	BucketName      string                 `json:"bucket"`
-	ConditionValues map[string][]string    `json:"conditions"`
-	IsOwner         bool                   `json:"owner"`
-	ObjectName      string                 `json:"object"`
-	Claims          map[string]interface{} `json:"claims"`
-	DenyOnly        bool                   `json:"denyOnly"` // only applies deny
+	AccountName     string              `json:"account"`
+	Groups          []string            `json:"groups"`
+	Action          Action              `json:"action"`
+	OriginalAction  Action              `json:"originalAction"`
+	BucketName      string              `json:"bucket"`
+	ConditionValues map[string][]string `json:"conditions"`
+	IsOwner         bool                `json:"owner"`
+	ObjectName      string              `json:"object"`
+	Claims          map[string]any      `json:"claims"`
+	DenyOnly        bool                `json:"denyOnly"` // only applies deny
 }
 
 // GetValuesFromClaims returns the list of values for the input claimName.
@@ -47,13 +53,13 @@ type Args struct {
 // - string
 // - comma separated values
 // - string array
-func GetValuesFromClaims(claims map[string]interface{}, claimName string) (set.StringSet, bool) {
+func GetValuesFromClaims(claims map[string]any, claimName string) (set.StringSet, bool) {
 	s := set.NewStringSet()
 	pname, ok := claims[claimName]
 	if !ok {
 		return s, false
 	}
-	pnames, ok := pname.([]interface{})
+	pnames, ok := pname.([]any)
 	if !ok {
 		pnameStr, ok := pname.(string)
 		if ok {
@@ -89,7 +95,7 @@ func GetValuesFromClaims(claims map[string]interface{}, claimName string) (set.S
 
 // GetPoliciesFromClaims returns the list of policies to be applied for this
 // incoming request, extracting the information from input JWT claims.
-func GetPoliciesFromClaims(claims map[string]interface{}, policyClaimName string) (set.StringSet, bool) {
+func GetPoliciesFromClaims(claims map[string]any, policyClaimName string) (set.StringSet, bool) {
 	return GetValuesFromClaims(claims, policyClaimName)
 }
 
@@ -112,9 +118,16 @@ func (a Args) GetRoleArn() string {
 
 // Policy - iam bucket iamp.
 type Policy struct {
-	ID         ID `json:"ID,omitempty"`
-	Version    string
-	Statements []Statement `json:"Statement"`
+	ID                   ID `json:"ID,omitempty"`
+	Version              string
+	Statements           []Statement `json:"Statement"`
+	actionStatementIndex map[Action][]int
+	hasDeny              bool
+}
+
+// HasDenyStatement returns if the policy has a deny statement.
+func (iamp *Policy) HasDenyStatement() bool {
+	return iamp.hasDeny
 }
 
 // MatchResource matches resource with match resource patterns
@@ -169,14 +182,126 @@ func (iamp Policy) IsAllowedActions(bucketName, objectName string, conditionValu
 	return actionSet
 }
 
-// IsAllowed - checks given policy args is allowed to continue the Rest API.
-func (iamp Policy) IsAllowed(args Args) bool {
+// IsAllowedSerial - checks if the given Args is allowed by any one of the given
+// policies in serial.
+//
+// This is currently the fastest implementation for our basic benchmark.
+func IsAllowedSerial(policies []Policy, args Args) bool {
+	gotAllow := false
+	for _, policy := range policies {
+		res := policy.Decide(&args)
+		if res == DenyDecision {
+			return false
+		}
+		if res == AllowDecision {
+			gotAllow = true
+		}
+	}
+	return gotAllow
+}
+
+// IsAllowedPar - checks if the given Args is allowed by any one of the given
+// policies in parallel (when len(policies) > 100).
+func IsAllowedPar(policies []Policy, args Args) bool {
+	if len(policies) == 0 {
+		return false
+	}
+
+	// If there is only one policy, use it directly.
+	if len(policies) == 1 {
+		return policies[0].IsAllowed(args)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// This must be at least 1.
+	const numPoliciesPerWorker = 25
+
+	// Here numJobs = ceil(len(policies) / numPoliciesPerWorker) - computed
+	// using integer arithmetic
+	numJobs := (len(policies) + numPoliciesPerWorker - 1) / numPoliciesPerWorker
+
+	// get number of workers.
+	numWorkers := min(runtime.GOMAXPROCS(0), numJobs)
+
+	jobs := make(chan int, numJobs)
+	for i := range numJobs {
+		jobs <- i * numPoliciesPerWorker
+	}
+	close(jobs)
+
+	resultCh := make(chan Decision, len(policies))
+
+	var wg sync.WaitGroup
+	wg.Add(numWorkers)
+	for range numWorkers {
+		go func() {
+			defer wg.Done()
+			for i := range jobs {
+				select {
+				case <-ctx.Done():
+					return
+				default:
+				}
+
+				maxJ := min(i+numPoliciesPerWorker, len(policies))
+				res := NoDecision
+				for j := i; j < maxJ; j++ {
+					decision := policies[j].Decide(&args)
+					if decision == DenyDecision {
+						res = DenyDecision
+						break
+					} else if decision == AllowDecision {
+						res = AllowDecision
+					}
+				}
+
+				select {
+				case resultCh <- res:
+				case <-ctx.Done():
+					return
+				}
+			}
+		}()
+	}
+
+	gotAllow := false
+	for range numJobs {
+		res := <-resultCh
+		if res == DenyDecision {
+			cancel()
+			wg.Wait()
+			return false
+		}
+		if res == AllowDecision {
+			gotAllow = true
+		}
+	}
+
+	wg.Wait()
+	return gotAllow
+}
+
+// Decision is an enum type representing the decision made by the policy
+// for the given arguments.
+type Decision uint8
+
+// Possible decisions made by the policy.
+const (
+	NoDecision Decision = iota
+	AllowDecision
+	DenyDecision
+)
+
+// Decide - decides whether the given args is allowed or not. If no policy
+// statement explicitly allows or denies the operation in the Args, it returns
+// `noDecision`. It is upto the caller to handle such cases.
+func (iamp *Policy) Decide(args *Args) Decision {
 	// Check all deny statements. If any one statement denies, return false.
 	for _, statement := range iamp.Statements {
-		if statement.Effect == Deny {
-			if !statement.IsAllowed(args) {
-				return false
-			}
+		if statement.Effect == Deny && !statement.IsAllowedPtr(args) {
+			return DenyDecision
 		}
 	}
 
@@ -186,24 +311,44 @@ func (iamp Policy) IsAllowed(args Args) bool {
 	// specific scenarios where we only want to validate
 	// 'Deny' only policies.
 	if args.DenyOnly {
-		return true
+		return AllowDecision
 	}
 
 	// For owner, its allowed by default.
 	if args.IsOwner {
-		return true
+		return AllowDecision
 	}
 
 	// Check all allow statements. If any one statement allows, return true.
-	for _, statement := range iamp.Statements {
-		if statement.Effect == Allow {
-			if statement.IsAllowed(args) {
-				return true
+	if len(iamp.actionStatementIndex) > 0 {
+		if indexes, ok := iamp.actionStatementIndex[args.Action]; ok {
+			for _, index := range indexes {
+				statement := iamp.Statements[index]
+				if statement.Effect == Allow && statement.IsAllowedPtr(args) {
+					return AllowDecision
+				}
 			}
 		}
 	}
 
-	return false
+	for _, statement := range iamp.Statements {
+		if statement.Effect == Allow && statement.IsAllowedPtr(args) {
+			return AllowDecision
+		}
+	}
+
+	return NoDecision
+}
+
+// IsAllowed - checks given policy args is allowed to continue the Rest API.
+func (iamp Policy) IsAllowed(args Args) bool {
+	decision := iamp.Decide(&args)
+	if decision == NoDecision {
+		// No decision made, return false.
+		return false
+	}
+
+	return decision == AllowDecision
 }
 
 // IsEmpty - returns whether policy is empty or not.
@@ -227,39 +372,85 @@ func (iamp Policy) isValid() error {
 
 // MergePolicies merges all the given policies into a single policy dropping any
 // duplicate statements.
-func MergePolicies(inputs ...Policy) Policy {
-	var merged Policy
+func MergePolicies(inputs ...Policy) (merged Policy) {
+	if len(inputs) == 0 {
+		return
+	}
+
+	if len(inputs) == 1 {
+		return inputs[0]
+	}
+
+	totalStmts := 0
 	for _, p := range inputs {
 		if merged.Version == "" {
 			merged.Version = p.Version
 		}
+		totalStmts += len(p.Statements)
+	}
+	merged.Statements = make([]Statement, 0, totalStmts)
+	found := make(map[[16]byte]struct{}, totalStmts)
+
+	// Apply a base seed
+	var baseSeed [8]byte
+	rand.Read(baseSeed[:])
+	var seed uint64
+	binary.LittleEndian.PutUint64(baseSeed[:], seed)
+
+	for _, p := range inputs {
 		for _, st := range p.Statements {
-			merged.Statements = append(merged.Statements, st.Clone())
+			h := st.hash(seed)
+			if _, ok := found[h]; ok {
+				continue
+			}
+			found[h] = struct{}{}
+			merged.Statements = append(merged.Statements, st)
 		}
 	}
-	merged.dropDuplicateStatements()
+
+	merged.updateActionIndex()
 	return merged
 }
 
-func (iamp *Policy) dropDuplicateStatements() {
+func (iamp *Policy) dropDuplicateStatementsMany() {
+	// Calculate a hash for each.
+	// Drop statements with duplicate hashes.
+	found := make(map[[16]byte]struct{}, len(iamp.Statements))
+
+	// Apply a base seed
+	var baseSeed [8]byte
+	rand.Read(baseSeed[:])
+	var seed uint64
+	binary.LittleEndian.PutUint64(baseSeed[:], seed)
+	writeAt := 0
+	for _, s := range iamp.Statements {
+		h := s.hash(seed)
+		if _, ok := found[h]; ok {
+			// duplicate, do not write.
+			continue
+		}
+		found[h] = struct{}{}
+		iamp.Statements[writeAt] = s
+		writeAt++
+	}
+	iamp.Statements = iamp.Statements[:writeAt]
+}
+
+// dropDuplicateStatements removes duplicate statements using hashing.
+func (iamp *Policy) dropDuplicateStatementsOriginal() {
 	dups := make(map[int]struct{})
 	for i := range iamp.Statements {
 		if _, ok := dups[i]; ok {
-			// i is already a duplicate of some statement, so we do not need to
-			// compare with it.
 			continue
 		}
 		for j := i + 1; j < len(iamp.Statements); j++ {
 			if !iamp.Statements[i].Equals(iamp.Statements[j]) {
 				continue
 			}
-
-			// save duplicate statement index for removal.
 			dups[j] = struct{}{}
 		}
 	}
 
-	// remove duplicate items from the slice.
 	var c int
 	for i := range iamp.Statements {
 		if _, ok := dups[i]; ok {
@@ -269,6 +460,16 @@ func (iamp *Policy) dropDuplicateStatements() {
 		c++
 	}
 	iamp.Statements = iamp.Statements[:c]
+}
+
+// dropDuplicateStatements removes duplicate statements using hashing.
+func (iamp *Policy) dropDuplicateStatements() {
+	if len(iamp.Statements) <= 10 {
+		iamp.dropDuplicateStatementsOriginal()
+		return
+	}
+
+	iamp.dropDuplicateStatementsMany()
 }
 
 // UnmarshalJSON - decodes JSON data to Iamp.
@@ -282,6 +483,7 @@ func (iamp *Policy) UnmarshalJSON(data []byte) error {
 
 	p := Policy(sp)
 	p.dropDuplicateStatements()
+	p.updateActionIndex()
 	*iamp = p
 	return nil
 }
@@ -289,6 +491,33 @@ func (iamp *Policy) UnmarshalJSON(data []byte) error {
 // Validate - validates all statements are for given bucket or not.
 func (iamp Policy) Validate() error {
 	return iamp.isValid()
+}
+
+// updateActionIndex with latest statements()
+// maintains a reverse map of Action -> []Statements
+// for faster lookup and short-circuit.
+func (iamp *Policy) updateActionIndex() {
+	for i := range iamp.Statements {
+		stmt := &iamp.Statements[i]
+		if stmt.Effect == Deny {
+			iamp.hasDeny = true
+			continue
+		}
+		for action := range stmt.Actions {
+			if wildcard.Has(string(action)) {
+				// Do not store any 'wildcard' actions
+				// as we cannot optimize such actions.
+				continue
+			}
+			if iamp.actionStatementIndex == nil {
+				// do not create action statement index
+				// if we do not have any statement or actions
+				// to save them for, simply avoids allocations
+				iamp.actionStatementIndex = make(map[Action][]int, len(iamp.Statements))
+			}
+			iamp.actionStatementIndex[action] = append(iamp.actionStatementIndex[action], i)
+		}
+	}
 }
 
 // ParseConfig - parses data in given reader to Iamp.

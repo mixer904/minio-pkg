@@ -21,6 +21,8 @@ import (
 	"bytes"
 	"encoding/json"
 	"net"
+	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -157,6 +159,54 @@ func TestPolicyIsAllowedActions(t *testing.T) {
 
 	if allowedActions.Match(CreateBucketAction) {
 		t.Fatal("expected no CreateBucket in allowed actions, but found instead")
+	}
+}
+
+func TestPolicyIsAllowedCornerCase1(t *testing.T) {
+	policy1Str := `{
+   "Version":"2012-10-17",
+   "Statement":[
+       {
+           "Sid":"1",
+           "Effect":"Allow",
+           "Action": "s3:PutObject",
+           "Resource": "arn:aws:s3:::mybucket2/*"
+       },
+       {
+           "Sid":"2",
+           "Effect":"Allow",
+           "Action": "s3:*",
+           "Resource": "arn:aws:s3:::mybucket1/*"
+       }
+    ]
+}`
+	policy1, err := ParseConfig(strings.NewReader(policy1Str))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	args1 := Args{
+		AccountName:     "Q3AM3UQ867SPQQA43P2F",
+		Action:          PutObjectAction,
+		BucketName:      "mybucket1",
+		ConditionValues: nil,
+		ObjectName:      "myobject",
+	}
+
+	testCases := []struct {
+		policy         *Policy
+		args           Args
+		expectedResult bool
+	}{
+		{policy1, args1, true},
+	}
+
+	for i, testCase := range testCases {
+		result := testCase.policy.IsAllowed(testCase.args)
+
+		if result != testCase.expectedResult {
+			t.Errorf("case %v: expected: %v, got: %v\n", i+1, testCase.expectedResult, result)
+		}
 	}
 }
 
@@ -1607,11 +1657,424 @@ func TestMergePolicies(t *testing.T) {
 				},
 			},
 		},
+		{
+			inputs: []Policy{p1, p2, p3, p1, p2, p3, p1, p2, p3, p1, p2, p3, p1, p2, p3, p1, p2, p3, p1, p2, p3, p1, p2, p3, p1, p2, p3, p1, p2, p3, p1, p2, p3, p1, p2, p3, p1, p2, p3, p1, p2, p3, p1, p2, p3, p1, p2, p3, p1, p2, p3, p1, p2, p3, p1, p2, p3, p1, p2, p3, p1, p2, p3, p1, p2, p3},
+			expected: Policy{
+				Version: DefaultVersion,
+				Statements: []Statement{
+					NewStatement(
+						"",
+						Deny,
+						NewActionSet(AllAdminActions),
+						ResourceSet{},
+						condition.NewFunctions(),
+					),
+					NewStatement(
+						"",
+						Allow,
+						NewActionSet(AllActions),
+						NewResourceSet(NewResource("*")),
+						condition.NewFunctions(),
+					),
+					NewStatement(
+						"",
+						Allow,
+						NewActionSet(GetBucketLocationAction),
+						NewResourceSet(NewResource("mybucket")),
+						condition.NewFunctions(),
+					),
+				},
+			},
+		},
 	}
 	for i, testCase := range testCases {
-		got := MergePolicies(testCase.inputs...)
-		if !got.Equals(testCase.expected) {
-			t.Errorf("Case %d: expected: %v, got %v", i+1, got, testCase.expected)
-		}
+		t.Run(strconv.Itoa(i), func(t *testing.T) {
+			got := MergePolicies(testCase.inputs...)
+			if !got.Equals(testCase.expected) {
+				t.Errorf("Case %d: expected: %v, got %v", i, testCase.expected, got)
+			}
+		})
+	}
+}
+
+func TestJWTScopePolicyIntegration(t *testing.T) {
+	tests := []struct {
+		name           string
+		policyJSON     string
+		args           Args
+		expectedAllow  bool
+		expectParseErr bool
+	}{
+		// Positive case: Matching single scope with ForAnyValue:StringEquals
+		{
+			name: "Matching scope for ListBucket",
+			policyJSON: `{
+				"Version": "2012-10-17",
+				"Statement": [
+					{
+						"Effect": "Allow",
+						"Action": ["s3:GetObject", "s3:ListBucket"],
+						"Resource": ["arn:aws:s3:::bucket1/*"],
+						"Condition": {
+							"ForAnyValue:StringEquals": {
+								"jwt:scope": ["readonly"]
+							}
+						}
+					}
+				]
+			}`,
+			args: Args{
+				Action:          ListBucketAction,
+				BucketName:      "bucket1",
+				ObjectName:      "test.txt",
+				ConditionValues: map[string][]string{"scope": {"readonly"}},
+			},
+			expectedAllow: true,
+		},
+		{
+			name: "Matching scope for GetObject",
+			policyJSON: `{
+				"Version": "2012-10-17",
+				"Statement": [
+					{
+						"Effect": "Allow",
+						"Action": ["s3:GetObject", "s3:ListBucket"],
+						"Resource": ["arn:aws:s3:::bucket1/*"],
+						"Condition": {
+							"ForAnyValue:StringEquals": {
+								"jwt:scope": ["readonly"]
+							}
+						}
+					}
+				]
+			}`,
+			args: Args{
+				Action:          GetObjectAction,
+				BucketName:      "bucket1",
+				ObjectName:      "test.txt",
+				ConditionValues: map[string][]string{"scope": {"readonly"}},
+			},
+			expectedAllow: true,
+		},
+		// Negative case: Mismatched scope
+		{
+			name: "Mismatched scope for GetObject",
+			policyJSON: `{
+				"Version": "2012-10-17",
+				"Statement": [
+					{
+						"Effect": "Allow",
+						"Action": ["s3:GetObject"],
+						"Resource": ["arn:aws:s3:::bucket1/*"],
+						"Condition": {
+							"ForAnyValue:StringEquals": {
+								"jwt:scope": ["readonly"]
+							}
+						}
+					}
+				]
+			}`,
+			args: Args{
+				Action:          GetObjectAction,
+				BucketName:      "bucket1",
+				ObjectName:      "test.txt",
+				ConditionValues: map[string][]string{"scope": {"writeonly"}},
+			},
+			expectedAllow: false,
+		},
+		// Negative case: Missing scope claim
+		{
+			name: "Missing scope for GetObject",
+			policyJSON: `{
+				"Version": "2012-10-17",
+				"Statement": [
+					{
+						"Effect": "Allow",
+						"Action": ["s3:GetObject"],
+						"Resource": ["arn:aws:s3:::bucket1/*"],
+						"Condition": {
+							"ForAnyValue:StringEquals": {
+								"jwt:scope": ["readonly"]
+							}
+						}
+					}
+				]
+			}`,
+			args: Args{
+				Action:          GetObjectAction,
+				BucketName:      "bucket1",
+				ObjectName:      "test.txt",
+				ConditionValues: map[string][]string{},
+			},
+			expectedAllow: false,
+		},
+		// Deny effect with matching scope
+		{
+			name: "Deny effect with matching scope",
+			policyJSON: `{
+				"Version": "2012-10-17",
+				"Statement": [
+					{
+						"Effect": "Deny",
+						"Action": ["s3:GetObject"],
+						"Resource": ["arn:aws:s3:::bucket1/*"],
+						"Condition": {
+							"ForAnyValue:StringEquals": {
+								"jwt:scope": ["readonly"]
+							}
+						}
+					}
+				]
+			}`,
+			args: Args{
+				Action:          GetObjectAction,
+				BucketName:      "bucket1",
+				ObjectName:      "test.txt",
+				ConditionValues: map[string][]string{"scope": {"readonly"}},
+			},
+			expectedAllow: false,
+		},
+		// Multi-value scopes: Partial match with ForAnyValue
+		{
+			name: "Multi-value partial match",
+			policyJSON: `{
+				"Version": "2012-10-17",
+				"Statement": [
+					{
+						"Effect": "Allow",
+						"Action": ["s3:GetObject"],
+						"Resource": ["arn:aws:s3:::bucket1/*"],
+						"Condition": {
+							"ForAnyValue:StringEquals": {
+								"jwt:scope": ["readonly", "admin"]
+							}
+						}
+					}
+				]
+			}`,
+			args: Args{
+				Action:          GetObjectAction,
+				BucketName:      "bucket1",
+				ObjectName:      "test.txt",
+				ConditionValues: map[string][]string{"scope": {"readonly", "writeonly"}},
+			},
+			expectedAllow: true,
+		},
+		// Multi-value scopes: No match
+		{
+			name: "Multi-value no match",
+			policyJSON: `{
+				"Version": "2012-10-17",
+				"Statement": [
+					{
+						"Effect": "Allow",
+						"Action": ["s3:GetObject"],
+						"Resource": ["arn:aws:s3:::bucket1/*"],
+						"Condition": {
+							"ForAnyValue:StringEquals": {
+								"jwt:scope": ["readonly", "admin"]
+							}
+						}
+					}
+				]
+			}`,
+			args: Args{
+				Action:          GetObjectAction,
+				BucketName:      "bucket1",
+				ObjectName:      "test.txt",
+				ConditionValues: map[string][]string{"scope": {"guest"}},
+			},
+			expectedAllow: false,
+		},
+		// Different operator: StringNotEquals
+		{
+			name: "StringNotEquals mismatch allows",
+			policyJSON: `{
+				"Version": "2012-10-17",
+				"Statement": [
+					{
+						"Effect": "Allow",
+						"Action": ["s3:GetObject"],
+						"Resource": ["arn:aws:s3:::bucket1/*"],
+						"Condition": {
+							"StringNotEquals": {
+								"jwt:scope": ["readonly"]
+							}
+						}
+					}
+				]
+			}`,
+			args: Args{
+				Action:          GetObjectAction,
+				BucketName:      "bucket1",
+				ObjectName:      "test.txt",
+				ConditionValues: map[string][]string{"scope": {"writeonly"}},
+			},
+			expectedAllow: true,
+		},
+		{
+			name: "StringNotEquals match denies",
+			policyJSON: `{
+				"Version": "2012-10-17",
+				"Statement": [
+					{
+						"Effect": "Allow",
+						"Action": ["s3:GetObject"],
+						"Resource": ["arn:aws:s3:::bucket1/*"],
+						"Condition": {
+							"StringNotEquals": {
+								"jwt:scope": ["readonly"]
+							}
+						}
+					}
+				]
+			}`,
+			args: Args{
+				Action:          GetObjectAction,
+				BucketName:      "bucket1",
+				ObjectName:      "test.txt",
+				ConditionValues: map[string][]string{"scope": {"readonly"}},
+			},
+			expectedAllow: false,
+		},
+		// Invalid operator: Expect parse error (assuming ParseConfig validates operators for JWTScope)
+		{
+			name: "Invalid operator NumericEquals",
+			policyJSON: `{
+				"Version": "2012-10-17",
+				"Statement": [
+					{
+						"Effect": "Allow",
+						"Action": ["s3:GetObject"],
+						"Resource": ["arn:aws:s3:::bucket1/*"],
+						"Condition": {
+							"NumericEquals": {
+								"jwt:scope": ["readonly"]
+							}
+						}
+					}
+				]
+			}`,
+			args:           Args{}, // Not used if parse fails
+			expectParseErr: true,
+		},
+		// Bucket-level resource for ListBucket (add bucket ARN if needed)
+		{
+			name: "Bucket-level ListBucket with matching scope",
+			policyJSON: `{
+				"Version": "2012-10-17",
+				"Statement": [
+					{
+						"Effect": "Allow",
+						"Action": ["s3:ListBucket"],
+						"Resource": ["arn:aws:s3:::bucket1"],
+						"Condition": {
+							"ForAnyValue:StringEquals": {
+								"jwt:scope": ["readonly"]
+							}
+						}
+					}
+				]
+			}`,
+			args: Args{
+				Action:          ListBucketAction,
+				BucketName:      "bucket1",
+				ObjectName:      "", // No object for bucket action
+				ConditionValues: map[string][]string{"scope": {"readonly"}},
+			},
+			expectedAllow: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			p, err := ParseConfig(strings.NewReader(tt.policyJSON))
+			if tt.expectParseErr {
+				if err == nil {
+					t.Errorf("Expected ParseConfig error, got nil")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Unexpected ParseConfig error: %v", err)
+			}
+
+			got := p.IsAllowed(tt.args)
+			if got != tt.expectedAllow {
+				t.Errorf("Expected IsAllowed to return %v, got %v", tt.expectedAllow, got)
+			}
+		})
+	}
+}
+
+func TestDropDuplicateStatements(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    []Statement
+		expected []Statement
+	}{
+		{
+			name: "NoDuplicates",
+			input: []Statement{
+				setupStatement([]string{"s3:GetObject"}, []string{"arn:aws:s3:::bucket1/*"}, "Allow", nil),
+				setupStatement([]string{"s3:PutObject"}, []string{"arn:aws:s3:::bucket2/*"}, "Deny", nil),
+			},
+			expected: []Statement{
+				setupStatement([]string{"s3:GetObject"}, []string{"arn:aws:s3:::bucket1/*"}, "Allow", nil),
+				setupStatement([]string{"s3:PutObject"}, []string{"arn:aws:s3:::bucket2/*"}, "Deny", nil),
+			},
+		},
+		{
+			name: "AllDuplicates",
+			input: []Statement{
+				setupStatement([]string{"s3:GetObject"}, []string{"arn:aws:s3:::bucket1/*"}, "Allow", nil),
+				setupStatement([]string{"s3:GetObject"}, []string{"arn:aws:s3:::bucket1/*"}, "Allow", nil),
+				setupStatement([]string{"s3:GetObject"}, []string{"arn:aws:s3:::bucket1/*"}, "Allow", nil),
+			},
+			expected: []Statement{
+				setupStatement([]string{"s3:GetObject"}, []string{"arn:aws:s3:::bucket1/*"}, "Allow", nil),
+			},
+		},
+		{
+			name: "MixedDuplicates",
+			input: []Statement{
+				setupStatement([]string{"s3:GetObject"}, []string{"arn:aws:s3:::bucket1/*"}, "Allow", nil),
+				setupStatement([]string{"s3:GetObject"}, []string{"arn:aws:s3:::bucket1/*"}, "Allow", nil),
+				setupStatement([]string{"s3:PutObject"}, []string{"arn:aws:s3:::bucket2/*"}, "Deny", nil),
+				setupStatement([]string{"s3:GetObject"}, []string{"arn:aws:s3:::bucket3/*"}, "Allow", nil),
+			},
+			expected: []Statement{
+				setupStatement([]string{"s3:GetObject"}, []string{"arn:aws:s3:::bucket1/*"}, "Allow", nil),
+				setupStatement([]string{"s3:PutObject"}, []string{"arn:aws:s3:::bucket2/*"}, "Deny", nil),
+				setupStatement([]string{"s3:GetObject"}, []string{"arn:aws:s3:::bucket3/*"}, "Allow", nil),
+			},
+		},
+		{
+			name:     "EmptySlice",
+			input:    []Statement{},
+			expected: []Statement{},
+		},
+		{
+			name: "SingleStatement",
+			input: []Statement{
+				setupStatement([]string{"s3:GetObject"}, []string{"arn:aws:s3:::bucket1/*"}, "Allow", nil),
+			},
+			expected: []Statement{
+				setupStatement([]string{"s3:GetObject"}, []string{"arn:aws:s3:::bucket1/*"}, "Allow", nil),
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			policy := &Policy{
+				Version:    "2012-10-17",
+				Statements: tt.input,
+			}
+			policy.dropDuplicateStatements()
+			if !reflect.DeepEqual(policy.Statements, tt.expected) {
+				t.Errorf("got %v, want %v", policy.Statements, tt.expected)
+			}
+		})
 	}
 }
