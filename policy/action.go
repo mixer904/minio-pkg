@@ -112,6 +112,12 @@ const (
 	// PutBucketCorsAction - PutBucketCors Rest API action.
 	PutBucketCorsAction = "s3:PutBucketCors"
 
+	//  PutBucketQOSAction - allow set QOS configuration
+	PutBucketQOSAction = "s3:PutBucketQOS"
+
+	//  GetBucketQOSAction - allow get QOS configuration
+	GetBucketQOSAction = "s3:GetBucketQOS"
+
 	// PutObjectAction - PutObject Rest API action.
 	PutObjectAction = "s3:PutObject"
 
@@ -220,8 +226,8 @@ const (
 	AllActions = "s3:*"
 )
 
-// List of all supported actions.
-var supportedActions = map[Action]struct{}{
+// SupportedActions - list of all supported actions.
+var SupportedActions = map[Action]struct{}{
 	AbortMultipartUploadAction:             {},
 	CreateBucketAction:                     {},
 	DeleteBucketAction:                     {},
@@ -248,6 +254,8 @@ var supportedActions = map[Action]struct{}{
 	PutBucketNotificationAction:            {},
 	PutBucketPolicyAction:                  {},
 	PutBucketCorsAction:                    {},
+	PutBucketQOSAction:                     {},
+	GetBucketQOSAction:                     {},
 	PutObjectAction:                        {},
 	BypassGovernanceRetentionAction:        {},
 	PutObjectRetentionAction:               {},
@@ -281,12 +289,14 @@ var supportedActions = map[Action]struct{}{
 	RestoreObjectAction:                    {},
 	ResetBucketReplicationStateAction:      {},
 	PutObjectFanOutAction:                  {},
+	PutInventoryConfigurationAction:        {},
+	GetInventoryConfigurationAction:        {},
 	CreateSessionAction:                    {},
 	AllActions:                             {},
 }
 
-// List of all supported object actions.
-var supportedObjectActions = map[Action]struct{}{
+// SupportedObjectActions - list of all supported object actions.
+var SupportedObjectActions = map[Action]struct{}{
 	AllActions:                           {},
 	AbortMultipartUploadAction:           {},
 	DeleteObjectAction:                   {},
@@ -319,7 +329,7 @@ var supportedObjectActions = map[Action]struct{}{
 
 // IsObjectAction - returns whether action is object type or not.
 func (action Action) IsObjectAction() bool {
-	for supAction := range supportedObjectActions {
+	for supAction := range SupportedObjectActions {
 		if action.Match(supAction) {
 			return true
 		}
@@ -334,7 +344,7 @@ func (action Action) Match(a Action) bool {
 
 // IsValid - checks if action is valid or not.
 func (action Action) IsValid() bool {
-	for supAction := range supportedActions {
+	for supAction := range SupportedActions {
 		if action.Match(supAction) {
 			return true
 		}

@@ -55,19 +55,55 @@ func (statement Statement) IsAllowedPtr(args *Args) bool {
 			statement.NotActions.Match(args.Action) {
 			return false
 		}
+
 		resource := smallBufPool.Get().(*bytes.Buffer)
 		defer smallBufPool.Put(resource)
 		resource.Reset()
-
 		resource.WriteString(args.BucketName)
 		if args.ObjectName != "" {
 			if !strings.HasPrefix(args.ObjectName, "/") {
 				resource.WriteByte('/')
 			}
-
 			resource.WriteString(args.ObjectName)
 		} else {
 			resource.WriteByte('/')
+		}
+
+		if statement.isTable() && !TableAction(args.Action).IsValid() {
+			// When a tables policy statement (for example
+			//   "Action":   ["s3tables:GetTableData"],
+			//   "Resource": ["arn:aws:s3tables:::bucket/wh/table/uuid"]
+			// ) is evaluated for a plain S3 data-path action such as
+			// GetObject on (BucketName "wh", ObjectName "uuid[/...]"), the
+			// action match succeeds via implicitActions. However, the
+			// resource string built from Args ("wh/uuid[/...]") does not
+			// look like a tables ARN suffix ("bucket/wh/table/uuid"), so a
+			// direct string match against the S3 Tables resource
+			// would fail. In this specific case we know:
+			//   - the statement is a tables statement,
+			//   - the incoming action is covered implicitly (not a table API),
+			//   - and the stored policy resource is S3 Tables style.
+			// To allow GetObject/ListMultipartUploadParts/etc. when
+			// s3tables:GetTableData (or similar) is granted, normalize the
+			// S3 data-path resource into the canonical tables form before
+			// running the usual resource match.
+			if !isTableResourceString(resource.String()) {
+				if args.BucketName == "" || args.ObjectName == "" {
+					return false
+				}
+				objectName := args.ObjectName
+				if idx := strings.IndexByte(objectName, '/'); idx >= 0 {
+					objectName = objectName[:idx]
+				}
+				resource.Reset()
+				resource.WriteString("bucket/")
+				resource.WriteString(args.BucketName)
+				resource.WriteString("/table/")
+				resource.WriteString(objectName)
+				if !isTableResourceString(resource.String()) {
+					return false
+				}
+			}
 		}
 
 		if statement.isKMS() {
@@ -126,6 +162,24 @@ func (statement Statement) isKMS() bool {
 	return false
 }
 
+func (statement Statement) isTable() bool {
+	for action := range statement.Actions {
+		if TableAction(action).IsValid() {
+			return true
+		}
+	}
+	return false
+}
+
+func (statement Statement) isVectors() bool {
+	for action := range statement.Actions {
+		if VectorsAction(action).IsValid() {
+			return true
+		}
+	}
+	return false
+}
+
 // isValid - checks whether statement is valid or not.
 func (statement Statement) isValid() error {
 	if !statement.Effect.IsValid() {
@@ -178,6 +232,86 @@ func (statement Statement) isValid() error {
 		if err := statement.NotResources.ValidateKMS(); err != nil {
 			return err
 		}
+		return nil
+	}
+
+	if statement.isTable() {
+		if err := statement.Actions.ValidateTable(); err != nil {
+			return err
+		}
+		for action := range statement.Actions {
+			keys := statement.Conditions.Keys()
+			keyDiff := keys.Difference(tableActionConditionKeyMap[action])
+			if !keyDiff.IsEmpty() {
+				return Errorf("unsupported condition keys '%v' used for action '%v'", keyDiff, action)
+			}
+		}
+
+		if len(statement.Resources) == 0 && len(statement.NotResources) == 0 {
+			return Errorf("Resource must not be empty")
+		}
+
+		if len(statement.Resources) > 0 && len(statement.NotResources) > 0 {
+			return Errorf("Resource and NotResource cannot be specified in the same statement")
+		}
+
+		if err := statement.Resources.ValidateTable(); err != nil {
+			return err
+		}
+
+		if err := statement.NotResources.ValidateTable(); err != nil {
+			return err
+		}
+
+		for action := range statement.Actions {
+			if len(statement.Resources) > 0 && !statement.Resources.ObjectResourceExists() && !statement.Resources.BucketResourceExists() {
+				return Errorf("unsupported Resource found %v for action %v", statement.Resources, action)
+			}
+			if len(statement.NotResources) > 0 && !statement.NotResources.ObjectResourceExists() && !statement.NotResources.BucketResourceExists() {
+				return Errorf("unsupported NotResource found %v for action %v", statement.NotResources, action)
+			}
+		}
+
+		return nil
+	}
+
+	if statement.isVectors() {
+		if err := statement.Actions.ValidateVectors(); err != nil {
+			return err
+		}
+		for action := range statement.Actions {
+			keys := statement.Conditions.Keys()
+			keyDiff := keys.Difference(VectorsActionConditionKeyMap[action])
+			if !keyDiff.IsEmpty() {
+				return Errorf("unsupported condition keys '%v' used for action '%v'", keyDiff, action)
+			}
+		}
+
+		if len(statement.Resources) == 0 && len(statement.NotResources) == 0 {
+			return Errorf("Resource must not be empty")
+		}
+
+		if len(statement.Resources) > 0 && len(statement.NotResources) > 0 {
+			return Errorf("Resource and NotResource cannot be specified in the same statement")
+		}
+
+		if err := statement.Resources.ValidateVectors(); err != nil {
+			return err
+		}
+
+		if err := statement.NotResources.ValidateVectors(); err != nil {
+			return err
+		}
+
+		for action := range statement.Actions {
+			if len(statement.Resources) > 0 && !statement.Resources.ObjectResourceExists() && !statement.Resources.BucketResourceExists() {
+				return Errorf("unsupported Resource found %v for action %v", statement.Resources, action)
+			}
+			if len(statement.NotResources) > 0 && !statement.NotResources.ObjectResourceExists() && !statement.NotResources.BucketResourceExists() {
+				return Errorf("unsupported NotResource found %v for action %v", statement.NotResources, action)
+			}
+		}
+
 		return nil
 	}
 

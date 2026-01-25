@@ -31,6 +31,9 @@ const (
 	// ResourceARNPrefix - resource S3 ARN prefix as per S3 specification.
 	ResourceARNPrefix = "arn:aws:s3:::"
 
+	// ResourceARNS3TablesPrefix - resource prefix for Amazon S3 Tables resources.
+	ResourceARNS3TablesPrefix = "arn:aws:s3tables:::"
+
 	// ResourceARNKMSPrefix is for KMS key resources. MinIO specific API.
 	ResourceARNKMSPrefix = "arn:minio:kms:::"
 )
@@ -45,6 +48,9 @@ const (
 	// ResourceARNS3 is the ARN prefix type for S3 resources.
 	ResourceARNS3
 
+	// ResourceARNS3Tables is the ARN prefix type for Amazon S3 Tables resources.
+	ResourceARNS3Tables
+
 	// ResourceARNKMS is the ARN prefix type for MinIO KMS resources.
 	ResourceARNKMS
 
@@ -54,9 +60,10 @@ const (
 
 // ARNTypeToPrefix maps the type to prefix string
 var ARNTypeToPrefix = map[ResourceARNType]string{
-	ResourceARNS3:  ResourceARNPrefix,
-	ResourceARNKMS: ResourceARNKMSPrefix,
-	ResourceARNAll: "*",
+	ResourceARNS3:       ResourceARNPrefix,
+	ResourceARNS3Tables: ResourceARNS3TablesPrefix,
+	ResourceARNKMS:      ResourceARNKMSPrefix,
+	ResourceARNAll:      "*",
 }
 
 // ARNPrefixToType maps prefix to types.
@@ -87,6 +94,10 @@ func (r Resource) isS3() bool {
 	return r.Type == ResourceARNS3 || r.Type == ResourceARNAll
 }
 
+func (r Resource) isTable() bool {
+	return r.Type == ResourceARNS3Tables || r.Type == ResourceARNAll
+}
+
 func (r Resource) isBucketPattern() bool {
 	return !strings.Contains(r.Pattern, "/") || r.Pattern == "*"
 }
@@ -101,6 +112,11 @@ func (r Resource) IsValid() bool {
 		return false
 	}
 	if r.isS3() {
+		if strings.HasPrefix(r.Pattern, "/") {
+			return false
+		}
+	}
+	if r.isTable() {
 		if strings.HasPrefix(r.Pattern, "/") {
 			return false
 		}
@@ -196,7 +212,7 @@ func (r *Resource) UnmarshalJSON(data []byte) error {
 		return err
 	}
 
-	parsedResource, err := parseResource(s)
+	parsedResource, err := ParseResource(s)
 	if err != nil {
 		return err
 	}
@@ -237,8 +253,8 @@ func (r Resource) ValidateBucket(bucketName string) error {
 	return nil
 }
 
-// parseResource - parses string to Resource.
-func parseResource(s string) (Resource, error) {
+// ParseResource - parses string to Resource.
+func ParseResource(s string) (Resource, error) {
 	r := Resource{}
 	for k, v := range ARNPrefixToType {
 		if s == k {
@@ -277,5 +293,33 @@ func NewKMSResource(pattern string) Resource {
 	return Resource{
 		Pattern: pattern,
 		Type:    ResourceARNKMS,
+	}
+}
+
+// isTableResourceString reports whether s has the form
+// bucket/<bucket-name>/(table|view)[/<id>].
+func isTableResourceString(s string) bool {
+	if !strings.HasPrefix(s, "bucket/") {
+		return false
+	}
+	rest := strings.TrimPrefix(s, "bucket/")
+	parts := strings.Split(rest, "/")
+	if len(parts) < 2 || len(parts) > 3 {
+		return false
+	}
+	if parts[0] == "" {
+		return false
+	}
+	if parts[1] != "table" && parts[1] != "view" {
+		return false
+	}
+	return true
+}
+
+// NewS3TablesResource - creates new resource with type S3 Tables
+func NewS3TablesResource(pattern string) Resource {
+	return Resource{
+		Pattern: pattern,
+		Type:    ResourceARNS3Tables,
 	}
 }

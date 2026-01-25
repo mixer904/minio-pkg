@@ -1,5 +1,4 @@
 //go:build linux
-// +build linux
 
 // Copyright (c) 2015-2021 MinIO, Inc.
 //
@@ -23,4 +22,4 @@ package certs
 import "github.com/rjeczalik/notify"
 
 // eventWrite contains the notify events that will cause a write
-var eventWrite = []notify.Event{notify.InCloseWrite}
+var eventWrite = []notify.Event{notify.InCloseWrite, notify.InMovedTo}

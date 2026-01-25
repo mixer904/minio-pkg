@@ -89,8 +89,10 @@ func TestResourceIsValid(t *testing.T) {
 		{NewResource("mybucket?0/2010/photos/*"), true},
 		{NewResource("mybucket"), true},
 		{NewResource("mybucket?0"), true},
+		{Resource{Pattern: "us-east-1:111122223333:bucket/demo/table/*", Type: ResourceARNS3Tables}, true},
 		{NewResource("/*"), false},
 		{NewResource(""), false},
+		{Resource{Pattern: "", Type: ResourceARNS3Tables}, false},
 
 		{NewKMSResource("*"), true},
 		{NewKMSResource("mykey*"), true},
@@ -160,6 +162,7 @@ func TestResourceMarshalJSON(t *testing.T) {
 		{NewResource("mybucket/*"), []byte(`"arn:aws:s3:::mybucket/*"`), false},
 		{NewResource("mybucket*/myobject"), []byte(`"arn:aws:s3:::mybucket*/myobject"`), false},
 		{NewResource("mybucket?0/2010/photos/*"), []byte(`"arn:aws:s3:::mybucket?0/2010/photos/*"`), false},
+		{Resource{Pattern: "bucket/demo/table/*", Type: ResourceARNS3Tables}, []byte(`"arn:aws:s3tables:::bucket/demo/table/*"`), false},
 		{Resource{}, nil, true},
 	}
 
@@ -192,6 +195,7 @@ func TestResourceUnmarshalJSON(t *testing.T) {
 		{[]byte(`"arn:aws:s3:::mybucket/*"`), NewResource("mybucket/*"), false},
 		{[]byte(`"arn:aws:s3:::mybucket*/myobject"`), NewResource("mybucket*/myobject"), false},
 		{[]byte(`"arn:aws:s3:::mybucket?0/2010/photos/*"`), NewResource("mybucket?0/2010/photos/*"), false},
+		{[]byte(`"arn:aws:s3tables:::bucket/demo/table/*"`), Resource{Pattern: "bucket/demo/table/*", Type: ResourceARNS3Tables}, false},
 		{[]byte(`"mybucket/myobject*"`), Resource{}, true},
 		{[]byte(`"arn:aws:s3:::/*"`), Resource{}, true},
 	}
@@ -210,6 +214,68 @@ func TestResourceUnmarshalJSON(t *testing.T) {
 				t.Fatalf("case %v: result: expected: %v, got: %v", i+1, testCase.expectedResult, result)
 			}
 		}
+	}
+}
+
+func TestIsTableResourceString(t *testing.T) {
+	tests := []struct {
+		name string
+		s    string
+		want bool
+	}{
+		{
+			name: "table without id",
+			s:    "bucket/warehouse/table",
+			want: true,
+		},
+		{
+			name: "table with id",
+			s:    "bucket/warehouse/table/uuid-123",
+			want: true,
+		},
+		{
+			name: "view without id",
+			s:    "bucket/warehouse/view",
+			want: true,
+		},
+		{
+			name: "view with id",
+			s:    "bucket/warehouse/view/view-uuid",
+			want: true,
+		},
+		{
+			name: "missing bucket name",
+			s:    "bucket//table/uuid",
+			want: false,
+		},
+		{
+			name: "wrong prefix",
+			s:    "wh/table/uuid",
+			want: false,
+		},
+		{
+			name: "not table or view kind",
+			s:    "bucket/warehouse/other/uuid",
+			want: false,
+		},
+		{
+			name: "too many segments",
+			s:    "bucket/wh/table/uuid/extra",
+			want: false,
+		},
+		{
+			name: "too few segments",
+			s:    "bucket/onlybucket",
+			want: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isTableResourceString(tt.s); got != tt.want {
+				t.Fatalf("isTableResourceString(%q) = %v, want %v", tt.s, got, tt.want)
+			}
+		})
 	}
 }
 

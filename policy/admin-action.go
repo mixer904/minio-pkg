@@ -19,6 +19,7 @@ package policy
 
 import (
 	"github.com/minio/pkg/v3/policy/condition"
+	"github.com/minio/pkg/v3/wildcard"
 )
 
 // AdminAction - admin policy action.
@@ -74,6 +75,8 @@ const (
 	ServiceStopAdminAction = "admin:ServiceStop"
 	// ServiceFreezeAdminAction - allow freeze/unfreeze MinIO service.
 	ServiceFreezeAdminAction = "admin:ServiceFreeze"
+	// ServiceCordonAdminAction - allow cordon/uncordon MinIO service.
+	ServiceCordonAdminAction = "admin:ServiceCordon"
 
 	// ConfigUpdateAdminAction - allow MinIO config management
 	ConfigUpdateAdminAction = "admin:ConfigUpdate"
@@ -207,6 +210,11 @@ const (
 	// GenerateBatchJobAction allow requesting batch job templates
 	GenerateBatchJobAction = "admin:GenerateBatchJob"
 
+	// Inventory Control Actions
+
+	// InventoryControlAction - allows control of inventory jobs
+	InventoryControlAction = "admin:InventoryControl"
+
 	// All new v4 APIs
 
 	// ClusterInfoAction - allow cluster summary
@@ -233,18 +241,33 @@ const (
 	// DriveInfoAction - allow drive specific summary and detail
 	DriveInfoAction = "admin:DriveInfo"
 
-	//  SetQOSConfigAction - allow set QOS configuration
-	SetQOSConfigAction = "admin:SetQOSConfig"
+	// Delta Sharing Actions
 
-	//  GetQOSConfigAction - allow get QOS configuration
-	GetQOSConfigAction = "admin:GetQOSConfig"
+	// DeltaSharingAdminAction - allow managing Delta Sharing shares and tokens
+	DeltaSharingAdminAction = "admin:DeltaSharing"
+	// DeltaSharingCreateShareAction - allow creating Delta Sharing shares
+	DeltaSharingCreateShareAction = "admin:DeltaSharingCreateShare"
+	// DeltaSharingDeleteShareAction - allow deleting Delta Sharing shares
+	DeltaSharingDeleteShareAction = "admin:DeltaSharingDeleteShare"
+	// DeltaSharingListSharesAction - allow listing Delta Sharing shares
+	DeltaSharingListSharesAction = "admin:DeltaSharingListShares"
+	// DeltaSharingGetShareAction - allow getting Delta Sharing share details
+	DeltaSharingGetShareAction = "admin:DeltaSharingGetShare"
+	// DeltaSharingUpdateShareAction - allow updating Delta Sharing shares
+	DeltaSharingUpdateShareAction = "admin:DeltaSharingUpdateShare"
+	// DeltaSharingCreateTokenAction - allow creating Delta Sharing tokens
+	DeltaSharingCreateTokenAction = "admin:DeltaSharingCreateToken"
+	// DeltaSharingDeleteTokenAction - allow deleting Delta Sharing tokens
+	DeltaSharingDeleteTokenAction = "admin:DeltaSharingDeleteToken"
+	// DeltaSharingListTokensAction - allow listing Delta Sharing tokens
+	DeltaSharingListTokensAction = "admin:DeltaSharingListTokens"
 
 	// AllAdminActions - provides all admin permissions
 	AllAdminActions = "admin:*"
 )
 
-// List of all supported admin actions.
-var supportedAdminActions = map[AdminAction]struct{}{
+// SupportedAdminActions - list of all supported admin actions.
+var SupportedAdminActions = map[AdminAction]struct{}{
 	HealAdminAction:                  {},
 	StorageInfoAdminAction:           {},
 	DataUsageInfoAdminAction:         {},
@@ -314,24 +337,45 @@ var supportedAdminActions = map[AdminAction]struct{}{
 	StartBatchJobAction:    {},
 	CancelBatchJobAction:   {},
 
-	ClusterInfoAction:  {},
-	PoolListAction:     {},
-	PoolInfoAction:     {},
-	NodeListAction:     {},
-	NodeInfoAction:     {},
-	SetInfoAction:      {},
-	DriveListAction:    {},
-	DriveInfoAction:    {},
-	SetQOSConfigAction: {},
-	GetQOSConfigAction: {},
+	InventoryControlAction: {},
+
+	ClusterInfoAction: {},
+	PoolListAction:    {},
+	PoolInfoAction:    {},
+	NodeListAction:    {},
+	NodeInfoAction:    {},
+	SetInfoAction:     {},
+	DriveListAction:   {},
+	DriveInfoAction:   {},
+
+	ServiceCordonAdminAction: {},
+
+	DeltaSharingAdminAction:       {},
+	DeltaSharingCreateShareAction: {},
+	DeltaSharingDeleteShareAction: {},
+	DeltaSharingListSharesAction:  {},
+	DeltaSharingGetShareAction:    {},
+	DeltaSharingUpdateShareAction: {},
+	DeltaSharingCreateTokenAction: {},
+	DeltaSharingDeleteTokenAction: {},
+	DeltaSharingListTokensAction:  {},
 
 	AllAdminActions: {},
 }
 
+// Match - matches action name with action pattern.
+func (action AdminAction) Match(a AdminAction) bool {
+	return wildcard.Match(string(action), string(a))
+}
+
 // IsValid - checks if action is valid or not.
 func (action AdminAction) IsValid() bool {
-	_, ok := supportedAdminActions[action]
-	return ok
+	for supAction := range SupportedAdminActions {
+		if action.Match(supAction) {
+			return true
+		}
+	}
+	return false
 }
 
 func createAdminActionConditionKeyMap() map[Action]condition.KeySet {
@@ -341,7 +385,7 @@ func createAdminActionConditionKeyMap() map[Action]condition.KeySet {
 	}
 
 	adminActionConditionKeyMap := map[Action]condition.KeySet{}
-	for act := range supportedAdminActions {
+	for act := range SupportedAdminActions {
 		adminActionConditionKeyMap[Action(act)] = condition.NewKeySet(allSupportedAdminKeys...)
 	}
 	return adminActionConditionKeyMap

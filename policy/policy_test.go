@@ -2078,3 +2078,641 @@ func TestDropDuplicateStatements(t *testing.T) {
 		})
 	}
 }
+
+func TestPolicyParseS3TablesExamples(t *testing.T) {
+	tests := []struct {
+		name              string
+		policyJSON        string
+		expectedActions   []Action
+		expectedResources []string
+		expectedCondKeys  []condition.KeyName
+	}{
+		{
+			name: "TableBucketMaintenance",
+			policyJSON: `{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "s3tables:PutTableBucketMaintenanceConfiguration"
+      ],
+      "Resource": "arn:aws:s3tables:::bucket/*"
+    }
+  ]
+}`,
+			expectedActions:   []Action{S3TablesPutTableBucketMaintenanceConfigurationAction},
+			expectedResources: []string{"arn:aws:s3tables:::bucket/*"},
+		},
+		{
+			name: "NamespaceSelectAccess",
+			policyJSON: `{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "s3tables:GetTableData",
+        "s3tables:GetTableMetadataLocation"
+      ],
+      "Resource": "arn:aws:s3tables:::bucket/amzn-s3-demo-table-bucket/table/*",
+      "Condition": {
+        "StringLike": {
+          "s3tables:namespace": "hr"
+        }
+      }
+    }
+  ]
+}`,
+			expectedActions:   []Action{S3TablesGetTableDataAction, S3TablesGetTableMetadataLocationAction},
+			expectedResources: []string{"arn:aws:s3tables:::bucket/amzn-s3-demo-table-bucket/table/*"},
+			expectedCondKeys:  []condition.KeyName{condition.S3TablesNamespace},
+		},
+		{
+			name: "TableDeleteFlow",
+			policyJSON: `{
+  "Version": "2012-10-17",
+  "Id": "DeleteTable",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "s3tables:DeleteTable",
+        "s3tables:UpdateTableMetadataLocation",
+        "s3tables:PutTableData",
+        "s3tables:GetTableMetadataLocation"
+      ],
+      "Resource": "arn:aws:s3tables:::bucket/amzn-s3-demo-bucket/table/tableUUID"
+    }
+  ]
+}`,
+			expectedActions: []Action{
+				S3TablesDeleteTableAction,
+				S3TablesUpdateTableMetadataLocationAction,
+				S3TablesPutTableDataAction,
+				S3TablesGetTableMetadataLocationAction,
+			},
+			expectedResources: []string{"arn:aws:s3tables:::bucket/amzn-s3-demo-bucket/table/tableUUID"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			p, err := ParseConfig(strings.NewReader(tt.policyJSON))
+			if err != nil {
+				t.Fatalf("unexpected parse error: %v", err)
+			}
+			if len(p.Statements) != 1 {
+				t.Fatalf("expected 1 statement, got %d", len(p.Statements))
+			}
+			st := p.Statements[0]
+
+			actions := st.Actions.ToSlice()
+			if len(actions) != len(tt.expectedActions) {
+				t.Fatalf("expected %d actions, got %d", len(tt.expectedActions), len(actions))
+			}
+			actionSet := make(map[Action]struct{}, len(actions))
+			for _, a := range actions {
+				actionSet[a] = struct{}{}
+			}
+			for _, want := range tt.expectedActions {
+				if _, ok := actionSet[want]; !ok {
+					t.Fatalf("expected action %v missing", want)
+				}
+			}
+
+			resources := st.Resources.ToSlice()
+			if len(resources) != len(tt.expectedResources) {
+				t.Fatalf("expected %d resources, got %d", len(tt.expectedResources), len(resources))
+			}
+			resourceSet := make(map[string]struct{}, len(resources))
+			for _, r := range resources {
+				resourceSet[r.String()] = struct{}{}
+			}
+			for _, want := range tt.expectedResources {
+				if _, ok := resourceSet[want]; !ok {
+					t.Fatalf("expected resource %q missing", want)
+				}
+			}
+
+			if len(tt.expectedCondKeys) > 0 {
+				keys := st.Conditions.Keys()
+				if len(keys) != len(tt.expectedCondKeys) {
+					t.Fatalf("expected %d condition keys, got %d", len(tt.expectedCondKeys), len(keys))
+				}
+				for _, keyName := range tt.expectedCondKeys {
+					if !keys.Match(keyName.ToKey()) {
+						t.Fatalf("expected condition key %v", keyName)
+					}
+				}
+			} else if len(st.Conditions) != 0 {
+				t.Fatalf("expected no conditions, got %v", st.Conditions)
+			}
+		})
+	}
+}
+
+func TestS3TablesActionsWithImplicitMatching(t *testing.T) {
+	policy1JSON := `{
+		"Version": "2012-10-17",
+		"Statement": [
+			{
+				"Effect": "Allow",
+				"Action": ["s3tables:GetTableData"],
+				"Resource": ["arn:aws:s3tables:::bucket/my-warehouse/table/table-uuid-123"]
+			}
+		]
+	}`
+
+	policy2JSON := `{
+		"Version": "2012-10-17",
+		"Statement": [
+			{
+				"Effect": "Allow",
+				"Action": ["s3tables:PutTableData"],
+				"Resource": ["arn:aws:s3tables:::bucket/test-warehouse/table/uuid-456"]
+			}
+		]
+	}`
+
+	policy3JSON := `{
+		"Version": "2012-10-17",
+		"Statement": [
+			{
+				"Effect": "Allow",
+				"Action": ["s3tables:GetTableData", "s3tables:PutTableData"],
+				"Resource": ["arn:aws:s3tables:::bucket/wh/table/id"]
+			}
+		]
+	}`
+
+	policy4JSON := `{
+		"Version": "2012-10-17",
+		"Statement": [
+			{
+				"Effect": "Allow",
+				"Action": ["s3tables:*"],
+				"Resource": ["arn:aws:s3tables:::bucket/all-warehouse/table/all-uuid"]
+			}
+		]
+	}`
+
+	testCases := []struct {
+		name           string
+		policyJSON     string
+		args           Args
+		expectedResult bool
+		description    string
+	}{
+		{
+			name:       "GetTableData direct match",
+			policyJSON: policy1JSON,
+			args: Args{
+				Action:     S3TablesGetTableDataAction,
+				BucketName: "bucket/my-warehouse/table/table-uuid-123",
+			},
+			expectedResult: true,
+			description:    "S3 Tables action should match S3 Tables resource directly",
+		},
+		{
+			name:       "GetTableData implicit GetObject match with resource conversion",
+			policyJSON: policy1JSON,
+			args: Args{
+				Action:     GetObjectAction,
+				BucketName: "my-warehouse",
+				ObjectName: "table-uuid-123",
+			},
+			expectedResult: true,
+			description:    "GetObject (implicit from GetTableData) should match when resource is converted from S3 to S3Tables format",
+		},
+		{
+			name:       "GetTableData implicit GetObject with extra path",
+			policyJSON: policy1JSON,
+			args: Args{
+				Action:     GetObjectAction,
+				BucketName: "my-warehouse",
+				ObjectName: "table-uuid-123/data/file.parquet",
+			},
+			expectedResult: true,
+			description:    "GetObject should match even with extra path segments (should be discarded in conversion)",
+		},
+		{
+			name:       "GetTableData implicit ListMultipartUploadParts match",
+			policyJSON: policy1JSON,
+			args: Args{
+				Action:     ListMultipartUploadPartsAction,
+				BucketName: "my-warehouse",
+				ObjectName: "table-uuid-123",
+			},
+			expectedResult: true,
+			description:    "ListMultipartUploadParts (implicit from GetTableData) should match with resource conversion",
+		},
+		{
+			name:       "GetTableData wrong warehouse - should not match",
+			policyJSON: policy1JSON,
+			args: Args{
+				Action:     GetObjectAction,
+				BucketName: "wrong-warehouse",
+				ObjectName: "table-uuid-123",
+			},
+			expectedResult: false,
+			description:    "Should not match when warehouse name doesn't match",
+		},
+		{
+			name:       "GetTableData wrong table uuid - should not match",
+			policyJSON: policy1JSON,
+			args: Args{
+				Action:     GetObjectAction,
+				BucketName: "my-warehouse",
+				ObjectName: "wrong-uuid",
+			},
+			expectedResult: false,
+			description:    "Should not match when table UUID doesn't match",
+		},
+		{
+			name:       "PutTableData direct match",
+			policyJSON: policy2JSON,
+			args: Args{
+				Action:     S3TablesPutTableDataAction,
+				BucketName: "bucket/test-warehouse/table/uuid-456",
+			},
+			expectedResult: true,
+			description:    "PutTableData action should match S3 Tables resource directly",
+		},
+		{
+			name:       "PutTableData implicit PutObject match",
+			policyJSON: policy2JSON,
+			args: Args{
+				Action:     PutObjectAction,
+				BucketName: "test-warehouse",
+				ObjectName: "uuid-456",
+			},
+			expectedResult: true,
+			description:    "PutObject (implicit from PutTableData) should match with resource conversion",
+		},
+		{
+			name:       "PutTableData implicit AbortMultipartUpload match",
+			policyJSON: policy2JSON,
+			args: Args{
+				Action:     AbortMultipartUploadAction,
+				BucketName: "test-warehouse",
+				ObjectName: "uuid-456/upload",
+			},
+			expectedResult: true,
+			description:    "AbortMultipartUpload (implicit from PutTableData) should match",
+		},
+		{
+			name:       "Multiple actions - GetObject implicit match",
+			policyJSON: policy3JSON,
+			args: Args{
+				Action:     GetObjectAction,
+				BucketName: "wh",
+				ObjectName: "id",
+			},
+			expectedResult: true,
+			description:    "Should match with multiple S3 Tables actions in statement",
+		},
+		{
+			name:       "Multiple actions - PutObject implicit match",
+			policyJSON: policy3JSON,
+			args: Args{
+				Action:     PutObjectAction,
+				BucketName: "wh",
+				ObjectName: "id",
+			},
+			expectedResult: true,
+			description:    "Should match PutObject when both GetTableData and PutTableData are allowed",
+		},
+		{
+			name:       "Non-implicit action should not match",
+			policyJSON: policy1JSON,
+			args: Args{
+				Action:     DeleteObjectAction,
+				BucketName: "my-warehouse",
+				ObjectName: "table-uuid-123",
+			},
+			expectedResult: false,
+			description:    "DeleteObject is not implicit from GetTableData, should not match",
+		},
+		{
+			name:       "s3tables:* allows GetObject implicitly",
+			policyJSON: policy4JSON,
+			args: Args{
+				Action:     GetObjectAction,
+				BucketName: "all-warehouse",
+				ObjectName: "all-uuid",
+			},
+			expectedResult: true,
+			description:    "s3tables:* should allow GetObject through implicit matching with resource conversion",
+		},
+		{
+			name:       "s3tables:* allows PutObject implicitly",
+			policyJSON: policy4JSON,
+			args: Args{
+				Action:     PutObjectAction,
+				BucketName: "all-warehouse",
+				ObjectName: "all-uuid",
+			},
+			expectedResult: true,
+			description:    "s3tables:* should allow PutObject through implicit matching",
+		},
+		{
+			name:       "s3tables:* allows ListMultipartUploadParts implicitly",
+			policyJSON: policy4JSON,
+			args: Args{
+				Action:     ListMultipartUploadPartsAction,
+				BucketName: "all-warehouse",
+				ObjectName: "all-uuid",
+			},
+			expectedResult: true,
+			description:    "s3tables:* should allow ListMultipartUploadParts through implicit matching",
+		},
+		{
+			name:       "s3tables:* allows AbortMultipartUpload implicitly",
+			policyJSON: policy4JSON,
+			args: Args{
+				Action:     AbortMultipartUploadAction,
+				BucketName: "all-warehouse",
+				ObjectName: "all-uuid",
+			},
+			expectedResult: true,
+			description:    "s3tables:* should allow AbortMultipartUpload through implicit matching",
+		},
+		{
+			name:       "s3tables:* with extra path segments",
+			policyJSON: policy4JSON,
+			args: Args{
+				Action:     GetObjectAction,
+				BucketName: "all-warehouse",
+				ObjectName: "all-uuid/extra/path/data.parquet",
+			},
+			expectedResult: true,
+			description:    "s3tables:* should match with extra path segments discarded",
+		},
+		{
+			name:       "s3tables:* wrong warehouse should not match",
+			policyJSON: policy4JSON,
+			args: Args{
+				Action:     GetObjectAction,
+				BucketName: "wrong-warehouse",
+				ObjectName: "all-uuid",
+			},
+			expectedResult: false,
+			description:    "s3tables:* should not match when warehouse name is wrong",
+		},
+		{
+			name:       "s3tables:* wrong uuid should not match",
+			policyJSON: policy4JSON,
+			args: Args{
+				Action:     PutObjectAction,
+				BucketName: "all-warehouse",
+				ObjectName: "wrong-uuid",
+			},
+			expectedResult: false,
+			description:    "s3tables:* should not match when table UUID is wrong",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			p, err := ParseConfig(strings.NewReader(tc.policyJSON))
+			if err != nil {
+				t.Fatalf("failed to parse policy: %v", err)
+			}
+
+			result := p.IsAllowed(tc.args)
+			if result != tc.expectedResult {
+				t.Errorf("%s: expected %v, got %v", tc.description, tc.expectedResult, result)
+			}
+		})
+	}
+}
+
+func TestPolicyParseS3VectorsExamples(t *testing.T) {
+	tests := []struct {
+		name              string
+		policyJSON        string
+		expectedActions   []Action
+		expectedResources []string
+	}{
+		{
+			name: "VectorBucketFullAccess",
+			policyJSON: `{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "s3vectors:CreateVectorBucket",
+        "s3vectors:DeleteVectorBucket",
+        "s3vectors:GetVectorBucket",
+        "s3vectors:ListVectorBuckets"
+      ],
+      "Resource": "arn:aws:s3:::vectors-bucket/*"
+    }
+  ]
+}`,
+			expectedActions: []Action{
+				Action(S3VectorsCreateVectorBucketAction),
+				Action(S3VectorsDeleteVectorBucketAction),
+				Action(S3VectorsGetVectorBucketAction),
+				Action(S3VectorsListVectorBucketsAction),
+			},
+			expectedResources: []string{"arn:aws:s3:::vectors-bucket/*"},
+		},
+		{
+			name: "IndexOperations",
+			policyJSON: `{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "s3vectors:CreateIndex",
+        "s3vectors:DeleteIndex",
+        "s3vectors:GetIndex",
+        "s3vectors:ListIndexes"
+      ],
+      "Resource": "arn:aws:s3:::vectors-bucket/*"
+    }
+  ]
+}`,
+			expectedActions: []Action{
+				Action(S3VectorsCreateIndexAction),
+				Action(S3VectorsDeleteIndexAction),
+				Action(S3VectorsGetIndexAction),
+				Action(S3VectorsListIndexesAction),
+			},
+			expectedResources: []string{"arn:aws:s3:::vectors-bucket/*"},
+		},
+		{
+			name: "VectorDataOperations",
+			policyJSON: `{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "s3vectors:PutVectors",
+        "s3vectors:GetVectors",
+        "s3vectors:DeleteVectors",
+        "s3vectors:ListVectors",
+        "s3vectors:QueryVectors"
+      ],
+      "Resource": "arn:aws:s3:::vectors-bucket/*"
+    }
+  ]
+}`,
+			expectedActions: []Action{
+				Action(S3VectorsPutVectorsAction),
+				Action(S3VectorsGetVectorsAction),
+				Action(S3VectorsDeleteVectorsAction),
+				Action(S3VectorsListVectorsAction),
+				Action(S3VectorsQueryVectorsAction),
+			},
+			expectedResources: []string{"arn:aws:s3:::vectors-bucket/*"},
+		},
+		{
+			name: "AllVectorsActions",
+			policyJSON: `{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": "s3vectors:*",
+      "Resource": "arn:aws:s3:::vectors-bucket/*"
+    }
+  ]
+}`,
+			expectedActions:   []Action{Action(AllS3VectorsActions)},
+			expectedResources: []string{"arn:aws:s3:::vectors-bucket/*"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			p, err := ParseConfig(strings.NewReader(tt.policyJSON))
+			if err != nil {
+				t.Fatalf("failed to parse policy: %v", err)
+			}
+
+			if len(p.Statements) != 1 {
+				t.Fatalf("expected 1 statement, got %d", len(p.Statements))
+			}
+
+			stmt := p.Statements[0]
+
+			// Check actions
+			if len(stmt.Actions) != len(tt.expectedActions) {
+				t.Errorf("expected %d actions, got %d", len(tt.expectedActions), len(stmt.Actions))
+			}
+			for _, expectedAction := range tt.expectedActions {
+				if !stmt.Actions.Contains(expectedAction) {
+					t.Errorf("expected action %v not found in statement", expectedAction)
+				}
+			}
+
+			// Check resources
+			if len(stmt.Resources) != len(tt.expectedResources) {
+				t.Errorf("expected %d resources, got %d", len(tt.expectedResources), len(stmt.Resources))
+			}
+			for _, expectedResource := range tt.expectedResources {
+				found := false
+				for r := range stmt.Resources {
+					if r.String() == expectedResource {
+						found = true
+						break
+					}
+				}
+				if !found {
+					t.Errorf("expected resource %v not found in statement", expectedResource)
+				}
+			}
+		})
+	}
+}
+
+func TestS3VectorsActionsAllowed(t *testing.T) {
+	policyJSON := `{
+		"Version": "2012-10-17",
+		"Statement": [
+			{
+				"Effect": "Allow",
+				"Action": ["s3vectors:*"],
+				"Resource": ["arn:aws:s3:::vectors-bucket/*"]
+			}
+		]
+	}`
+
+	testCases := []struct {
+		name           string
+		args           Args
+		expectedResult bool
+		description    string
+	}{
+		{
+			name: "CreateVectorBucket allowed",
+			args: Args{
+				Action:     Action(S3VectorsCreateVectorBucketAction),
+				BucketName: "vectors-bucket",
+				ObjectName: "my-vector-bucket",
+			},
+			expectedResult: true,
+			description:    "CreateVectorBucket should be allowed with s3vectors:*",
+		},
+		{
+			name: "ListIndexes allowed",
+			args: Args{
+				Action:     Action(S3VectorsListIndexesAction),
+				BucketName: "vectors-bucket",
+				ObjectName: "my-vector-bucket/indexes",
+			},
+			expectedResult: true,
+			description:    "ListIndexes should be allowed with s3vectors:*",
+		},
+		{
+			name: "PutVectors allowed",
+			args: Args{
+				Action:     Action(S3VectorsPutVectorsAction),
+				BucketName: "vectors-bucket",
+				ObjectName: "my-vector-bucket/index/my-index",
+			},
+			expectedResult: true,
+			description:    "PutVectors should be allowed with s3vectors:*",
+		},
+		{
+			name: "QueryVectors allowed",
+			args: Args{
+				Action:     Action(S3VectorsQueryVectorsAction),
+				BucketName: "vectors-bucket",
+				ObjectName: "my-vector-bucket/index/my-index",
+			},
+			expectedResult: true,
+			description:    "QueryVectors should be allowed with s3vectors:*",
+		},
+		{
+			name: "Wrong bucket not allowed",
+			args: Args{
+				Action:     Action(S3VectorsCreateVectorBucketAction),
+				BucketName: "wrong-bucket",
+				ObjectName: "my-vector-bucket",
+			},
+			expectedResult: false,
+			description:    "CreateVectorBucket should not be allowed on wrong bucket",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			p, err := ParseConfig(strings.NewReader(policyJSON))
+			if err != nil {
+				t.Fatalf("failed to parse policy: %v", err)
+			}
+
+			result := p.IsAllowed(tc.args)
+			if result != tc.expectedResult {
+				t.Errorf("%s: expected %v, got %v", tc.description, tc.expectedResult, result)
+			}
+		})
+	}
+}

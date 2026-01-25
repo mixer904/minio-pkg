@@ -135,7 +135,7 @@ func (resourceSet *ResourceSet) UnmarshalJSON(data []byte) error {
 
 	*resourceSet = make(ResourceSet)
 	for _, s := range sset.ToSlice() {
-		resource, err := parseResource(s)
+		resource, err := ParseResource(s)
 		if err != nil {
 			return err
 		}
@@ -169,6 +169,35 @@ func (resourceSet ResourceSet) ValidateKMS() error {
 	for resource := range resourceSet {
 		if !resource.isKMS() {
 			return Errorf("resource '%v' type is not KMS", resource)
+		}
+		if err := resource.Validate(); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// ValidateTable - validates ResourceSet is S3 Tables.
+func (resourceSet ResourceSet) ValidateTable() error {
+	for resource := range resourceSet {
+		if !resource.isTable() {
+			return Errorf("resource '%v' type is not S3 Tables", resource)
+		}
+		if err := resource.Validate(); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// ValidateVectors - validates ResourceSet for S3 Vectors.
+// S3 Vectors uses S3 ARN format for resources (e.g., arn:aws:s3:::vectors-bucket/*).
+func (resourceSet ResourceSet) ValidateVectors() error {
+	for resource := range resourceSet {
+		if !resource.isS3() {
+			return Errorf("resource '%v' type is not S3", resource)
 		}
 		if err := resource.Validate(); err != nil {
 			return err
