@@ -22,6 +22,7 @@ require (
 	github.com/mattn/go-isatty v0.0.24
 	github.com/minio/minio-go/v7 v7.4.1
 	github.com/minio/mux v1.10.1
+	github.com/pgsty/silo-pkg/v3 v3.15.0
 	github.com/pires/go-proxyproto v0.16.0
 	github.com/rjeczalik/notify v0.9.3
 	github.com/tinylib/msgp v1.6.5
