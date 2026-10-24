@@ -27,8 +27,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/lestrrat-go/jwx/v2/jwt"
-	"github.com/minio/pkg/v3/licverifier"
+	"github.com/lestrrat-go/jwx/v3/jwt"
+	"github.com/pgsty/silo-pkg/v3/licverifier"
 )
 
 const (

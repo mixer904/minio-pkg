@@ -25,7 +25,7 @@ import (
 
 	"github.com/minio/minio-go/v7/pkg/s3utils"
 	"github.com/minio/minio-go/v7/pkg/set"
-	"github.com/minio/pkg/v3/wildcard"
+	"github.com/pgsty/silo-pkg/v3/wildcard"
 )
 
 func substitute(values map[string][]string) func(string) string {
@@ -82,7 +82,8 @@ func (f stringFunc) name() name {
 func (f stringFunc) String() string {
 	valueStrings := f.values.ToSlice()
 	sort.Strings(valueStrings)
-	return fmt.Sprintf("%v:%v:%v", f.n, f.k, valueStrings)
+	// Equality and statement hashing use this representation; preserve value boundaries.
+	return fmt.Sprintf("%v:%v:%q", f.n, f.k, valueStrings)
 }
 
 func (f stringFunc) toMap() map[Key]ValueSet {

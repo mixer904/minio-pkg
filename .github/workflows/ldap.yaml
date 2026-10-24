@@ -5,11 +5,13 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  workflow_dispatch:
 
-# This ensures that previous jobs for the PR are canceled when the PR is
-# updated.
+# Cancel a superseded run for the same pull request or branch. github.head_ref
+# is only set on pull_request events, so keying on it alone put every push and
+# manual run in one group, where they cancelled each other.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.head_ref }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 permissions:
@@ -31,14 +33,15 @@ jobs:
           LDAP_ADMIN_PASSWORD: "admin"
     strategy:
       matrix:
-        go-version: [1.25.x]
+        go-version: [1.27.3]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version: ${{ matrix.go-version }}
           check-latest: true
-      - uses: actions/cache@v4
+          cache: false # handled by the explicit cache step below
+      - uses: actions/cache@v6
         with:
           path: |
             ~/.cache/go-build

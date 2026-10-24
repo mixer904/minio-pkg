@@ -91,32 +91,58 @@ func (l *Config) Clone() (cloned Config) {
 }
 
 func (l *Config) connect(ldapAddr string) (ldapConn *ldap.Conn, err error) {
-	if l.ServerInsecure {
+	// StartTLS wins over ServerInsecure when both are set. MinIO exposes the two
+	// as independent switches (MINIO_IDENTITY_LDAP_SERVER_INSECURE and
+	// _SERVER_STARTTLS) and Validate does not reject the combination, so it is
+	// reachable. Both settings dial plain either way; the difference is whether
+	// the connection is then upgraded, and taking the insecure branch first
+	// skips the upgrade and puts the bind credentials on the wire in the clear.
+	if l.ServerInsecure && !l.ServerStartTLS {
 		ldapConn, err = ldap.DialURL("ldap://" + ldapAddr)
 	} else {
+		// We need to fix up the ServerName in the TLS config to match the
+		// host name to which we are actually connecting - this may be
+		// different from the originally configured host name if this
+		// ldapAddr was derived from an SRV lookup.
+		var host string
+		host, _, err = net.SplitHostPort(ldapAddr)
+		if err != nil {
+			return nil, err
+		}
+		// Clone returns nil for a nil receiver, and this path is now reached for
+		// plain ldaps:// too, not only for StartTLS as it once was. A Config
+		// that leaves TLS unset would dereference nil on the next line.
+		tlsConfig := l.TLS.Clone()
+		if tlsConfig == nil {
+			tlsConfig = &tls.Config{}
+		}
+		tlsConfig.ServerName = host
+
 		if l.ServerStartTLS {
 			ldapConn, err = ldap.DialURL("ldap://" + ldapAddr)
 		} else {
-			ldapConn, err = ldap.DialURL("ldaps://" + ldapAddr)
+			ldapConn, err = ldap.DialURL("ldaps://"+ldapAddr, ldap.DialWithTLSConfig(tlsConfig))
+		}
+
+		if ldapConn != nil && l.ServerStartTLS {
+			// The timeout has to be armed before StartTLS, not after. go-ldap
+			// starts its request timer only when requestTimeout > 0, and
+			// StartTLS then waits on the response with no deadline of its own,
+			// so a server that completes the TCP handshake and never answers
+			// the extended request holds this goroutine forever.
+			ldapConn.SetTimeout(30 * time.Second)
+			if err = ldapConn.StartTLS(tlsConfig); err != nil {
+				// Callers only take ownership of a connection that comes back
+				// without an error, so a failed upgrade has to be closed here
+				// or the socket is left behind on every attempt.
+				ldapConn.Close()
+				return nil, err
+			}
 		}
 	}
 
 	if ldapConn != nil {
 		ldapConn.SetTimeout(30 * time.Second) // Change default timeout to 30 seconds.
-		if l.ServerStartTLS {
-			// we need to fix up the ServerName in the TLS config to match the
-			// host name to which we are actually connecting - this may be
-			// different from the originally configured host name if this
-			// ldapAddr was derived from an SRV lookup
-			var host string
-			host, _, err = net.SplitHostPort(ldapAddr)
-			if err != nil {
-				return nil, err
-			}
-			tlsConfig := l.TLS.Clone()
-			tlsConfig.ServerName = host
-			err = ldapConn.StartTLS(tlsConfig)
-		}
 	}
 
 	return ldapConn, err

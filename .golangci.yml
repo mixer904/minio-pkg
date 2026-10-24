@@ -2,7 +2,7 @@ version: "2"
 linters:
   default: none
   enable:
-    - gomodguard
+    - gomodguard_v2
     - govet
     - ineffassign
     - misspell
@@ -25,6 +25,8 @@ linters:
       - path: sftp/sftp.go$
         text: "SA1019: ne.Temporary"
       - path: net/.+\.go$
+        text: "var-naming: avoid package names that conflict with Go standard library package names"
+      - path: quick/.+\.go$
         text: "var-naming: avoid package names that conflict with Go standard library package names"
     paths:
       - third_party$

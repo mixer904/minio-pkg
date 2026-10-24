@@ -18,8 +18,10 @@
 package policy
 
 import (
-	"github.com/minio/pkg/v3/policy/condition"
-	"github.com/minio/pkg/v3/wildcard"
+	"strings"
+
+	"github.com/pgsty/silo-pkg/v3/policy/condition"
+	"github.com/pgsty/silo-pkg/v3/wildcard"
 )
 
 // AdminAction - admin policy action.
@@ -52,10 +54,18 @@ const (
 	TraceAdminAction = "admin:ServerTrace"
 	// ConsoleLogAdminAction - allow listing console logs on terminal
 	ConsoleLogAdminAction = "admin:ConsoleLog"
+	// KMSEnableAdminAction - allow enabling the builtin KMS
+	KMSEnableAdminAction = "admin:KMSEnable"
+	// KMSBackupAdminAction - allow backing up builtin KMS keys
+	KMSBackupAdminAction = "admin:KMSBackup"
+	// KMSRestoreAdminAction - allow restoring builtin KMS keys
+	KMSRestoreAdminAction = "admin:KMSRestore"
 	// KMSCreateKeyAdminAction - allow creating a new KMS master key
 	KMSCreateKeyAdminAction = "admin:KMSCreateKey"
 	// KMSKeyStatusAdminAction - allow getting KMS key status
 	KMSKeyStatusAdminAction = "admin:KMSKeyStatus"
+	// KMSKeyRotateAdminAction - allow rotating KMS keys
+	KMSKeyRotateAdminAction = "admin:KMSKeyRotate"
 	// ServerInfoAdminAction - allow listing server info
 	ServerInfoAdminAction = "admin:ServerInfo"
 	// HealthInfoAdminAction - allow obtaining cluster health information
@@ -93,6 +103,8 @@ const (
 	DisableUserAdminAction = "admin:DisableUser"
 	// GetUserAdminAction - allows GET permission on user info
 	GetUserAdminAction = "admin:GetUser"
+	// ChangeMyPasswordAdminAction - allow changing own password
+	ChangeMyPasswordAdminAction = "admin:ChangeMyPassword"
 
 	// Cluster Replicate Actions
 
@@ -109,6 +121,15 @@ const (
 	// SiteReplicationOperationAction - allow performing site replication
 	// create/update/delete operations to peers
 	SiteReplicationOperationAction = "admin:SiteReplicationOperation"
+
+	// Tables Replication Actions
+
+	// TablesReplicationAddAction - allow adding tables replication targets
+	TablesReplicationAddAction = "admin:TablesReplicationAdd"
+	// TablesReplicationRemoveAction - allow removing tables replication targets
+	TablesReplicationRemoveAction = "admin:TablesReplicationRemove"
+	// TablesReplicationInfoAction - allow getting tables replication info/status
+	TablesReplicationInfoAction = "admin:TablesReplicationInfo"
 
 	// Service account Actions
 
@@ -261,6 +282,17 @@ const (
 	DeltaSharingDeleteTokenAction = "admin:DeltaSharingDeleteToken"
 	// DeltaSharingListTokensAction - allow listing Delta Sharing tokens
 	DeltaSharingListTokensAction = "admin:DeltaSharingListTokens"
+	// ReadAlertsAction - allow reading stored alerts
+	ReadAlertsAction = "admin:ReadAlerts"
+
+	// Log Actions
+
+	// ReadAPILogsAction - allow reading stored API logs
+	ReadAPILogsAction = "admin:ReadAPILogs"
+	// ReadErrorLogsAction - allow reading stored error logs
+	ReadErrorLogsAction = "admin:ReadErrorLogs"
+	// ReadAuditLogsAction - allow reading stored audit logs
+	ReadAuditLogsAction = "admin:ReadAuditLogs"
 
 	// AllAdminActions - provides all admin permissions
 	AllAdminActions = "admin:*"
@@ -294,6 +326,7 @@ var SupportedAdminActions = map[AdminAction]struct{}{
 	EnableUserAdminAction:            {},
 	DisableUserAdminAction:           {},
 	GetUserAdminAction:               {},
+	ChangeMyPasswordAdminAction:      {},
 	AddUserToGroupAdminAction:        {},
 	RemoveUserFromGroupAdminAction:   {},
 	GetGroupAdminAction:              {},
@@ -327,15 +360,22 @@ var SupportedAdminActions = map[AdminAction]struct{}{
 	SiteReplicationRemoveAction:      {},
 	SiteReplicationResyncAction:      {},
 
+	TablesReplicationAddAction:    {},
+	TablesReplicationRemoveAction: {},
+	TablesReplicationInfoAction:   {},
+
 	ImportBucketMetadataAction: {},
 	ExportBucketMetadataAction: {},
 	ExportIAMAction:            {},
 	ImportIAMAction:            {},
 
+	ForceUnlockAdminAction: {},
+
 	ListBatchJobsAction:    {},
 	DescribeBatchJobAction: {},
 	StartBatchJobAction:    {},
 	CancelBatchJobAction:   {},
+	GenerateBatchJobAction: {},
 
 	InventoryControlAction: {},
 
@@ -360,7 +400,46 @@ var SupportedAdminActions = map[AdminAction]struct{}{
 	DeltaSharingDeleteTokenAction: {},
 	DeltaSharingListTokensAction:  {},
 
+	ReadAPILogsAction:   {},
+	ReadErrorLogsAction: {},
+	ReadAuditLogsAction: {},
+	ReadAlertsAction:    {},
+
 	AllAdminActions: {},
+}
+
+// AdminActionsWithResource enumerates admin actions that operate on
+// a specific bucket resource. When a policy statement contains one of
+// these actions *and* specifies a Resource, the resource is enforced
+// against the target bucket. All other admin actions are resource-less;
+// any Resource specified in the statement is ignored for them.
+var AdminActionsWithResource = map[AdminAction]struct{}{
+	SetBucketQuotaAdminAction:  {},
+	GetBucketQuotaAdminAction:  {},
+	SetBucketTargetAction:      {},
+	GetBucketTargetAction:      {},
+	ReplicationDiff:            {},
+	ImportBucketMetadataAction: {},
+	ExportBucketMetadataAction: {},
+	HealAdminAction:            {},
+	InventoryControlAction:     {},
+}
+
+// HasResource reports whether this admin action operates on a bucket resource.
+func (action AdminAction) HasResource() bool {
+	if _, ok := AdminActionsWithResource[action]; ok {
+		return true
+	}
+	if !wildcard.Has(string(action)) {
+		// No wildcards, so only an exact match counts.
+		return false
+	}
+	for a := range AdminActionsWithResource {
+		if action.Match(a) {
+			return true
+		}
+	}
+	return false
 }
 
 // Match - matches action name with action pattern.
@@ -370,12 +449,39 @@ func (action AdminAction) Match(a AdminAction) bool {
 
 // IsValid - checks if action is valid or not.
 func (action AdminAction) IsValid() bool {
+	if _, ok := SupportedAdminActions[action]; ok {
+		return true
+	}
+	s := string(action)
+	star := strings.IndexAny(s, "*?")
+	if star < 0 {
+		// No wildcards, so only an exact match counts.
+		return false
+	}
+	if !canMatchPrefix(s[:star], adminActionPrefix) {
+		// This runs on every request, so don't scan the whole set for
+		// patterns like "s3:*" that can never be admin actions.
+		return false
+	}
 	for supAction := range SupportedAdminActions {
 		if action.Match(supAction) {
 			return true
 		}
 	}
 	return false
+}
+
+// Every supported admin action starts with this.
+const adminActionPrefix = "admin:"
+
+// canMatchPrefix reports whether a pattern whose text before the first
+// wildcard is head can match a string starting with prefix. Either one may
+// be longer: "adm*" and "admin:Heal*" both pass.
+func canMatchPrefix(head, prefix string) bool {
+	if len(head) > len(prefix) {
+		return strings.HasPrefix(head, prefix)
+	}
+	return strings.HasPrefix(prefix, head)
 }
 
 func createAdminActionConditionKeyMap() map[Action]condition.KeySet {

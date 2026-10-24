@@ -20,10 +20,12 @@ package policy
 import (
 	"bytes"
 	"encoding/binary"
+	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 
-	"github.com/minio/pkg/v3/policy/condition"
+	"github.com/pgsty/silo-pkg/v3/policy/condition"
 	"github.com/zeebo/xxh3"
 )
 
@@ -43,6 +45,106 @@ var smallBufPool = sync.Pool{
 	New: func() interface{} { return &bytes.Buffer{} },
 }
 
+// legacyBucketResourceMatch, when true, restores the historical behavior in
+// which a bucket-level request (empty object name) is matched against policy
+// resources as "bucket/", so an object-only pattern such as
+// "arn:aws:s3:::bucket/*" also matches bucket-level actions. That behavior
+// over-grants on Allow statements (and over-blocks on Deny statements) and is
+// withheld by default for the sensitive bucket-level write actions listed in
+// sensitiveBucketMutationActions. It is meant to be configured once at server
+// startup (see SetLegacyBucketResourceMatch) and only read while serving.
+var legacyBucketResourceMatch atomic.Bool
+
+// SetLegacyBucketResourceMatch toggles the compatibility shim documented on
+// legacyBucketResourceMatch. Call it once during startup, before serving
+// requests; it is safe to read concurrently afterwards.
+func SetLegacyBucketResourceMatch(enabled bool) {
+	legacyBucketResourceMatch.Store(enabled)
+}
+
+func init() {
+	// Fork-specific escape hatch: MINIO_API_LEGACY_BUCKET_RESOURCE_MATCH=on,
+	// read once at package initialization, restores the historical bucket
+	// resource matching described on legacyBucketResourceMatch. Kept self
+	// contained here (rather than wired from the server) so the hardening and
+	// its opt-out ship as a single, independently buildable change. Callers may
+	// still override it explicitly via SetLegacyBucketResourceMatch.
+	if os.Getenv("MINIO_API_LEGACY_BUCKET_RESOURCE_MATCH") == "on" {
+		legacyBucketResourceMatch.Store(true)
+	}
+}
+
+// sensitiveBucketMutationActions is the set of bucket-level write actions for
+// which an object-only resource pattern ("bucket/*") must not be honored as a
+// bucket-level grant.
+//
+// Membership is decided by one question: does reaching this action give the
+// caller something the object-scoped grant does not already give them? The
+// resource bug only fires when the statement grants the bucket-level action in
+// the first place, which in practice means "s3:*" — so the affected principal
+// already holds full read/write/delete over every object in the bucket. An
+// action that merely reconfigures the bucket adds nothing to that position; an
+// action that hands out access, defeats a protection the owner set, or
+// outlives the grant does:
+//
+//   - PutBucketPolicy / DeleteBucketPolicy — grant access to other principals,
+//     including anonymous, or grant the caller bucket-level actions it was
+//     never given. Self-escalation and public exposure;
+//   - PutBucketObjectLockConfiguration — defeat WORM retention, which exists
+//     precisely to stop a holder of write access from destroying data;
+//   - PutBucketVersioning — defeat version history, same class of protection;
+//   - PutReplicationConfiguration — copy the bucket to a chosen target under
+//     server credentials, and keep copying after the caller's access is gone;
+//   - PutBucketLifecycle — schedule expiry that likewise outlives the grant;
+//   - DeleteBucket / ForceDeleteBucket — destroy the bucket entity and its
+//     configuration irreversibly. This is the reproduction reported in
+//     upstream minio/minio issue #20449;
+//   - PutBucketCors / DeleteBucketCors / PutBucketQOS /
+//     PutInventoryConfiguration — no MinIO server behavior is attached to
+//     these today (no handler, or a handler that returns NotImplemented after
+//     the authorization check), so withholding them costs nothing and they are
+//     covered in advance should a handler ever be wired.
+//
+// Deliberately NOT protected, and asserted as such by
+// TestStatementBucketMutationDeliberatelyUnprotected:
+//
+//   - PutBucketTagging, PutBucketEncryption, PutBucketNotification — a tenant
+//     handed "s3:*" on "bucket/*" and told the bucket is theirs may legitimately
+//     tag it, set default encryption, or wire event notifications. None of the
+//     three grants the caller access it does not already have; the harm is to
+//     the owner's posture, not to the access boundary. Low security gain against
+//     a real compatibility cost, so they keep the historical matching until a
+//     migration-gated change;
+//   - CreateBucket — targets a bucket that does not exist yet, so there is
+//     nothing to mutate or destroy, and provisioning flows commonly create a
+//     tenant's bucket with that tenant's own "bucket/*" credentials;
+//   - the read/list family (ListBucket, GetBucketLocation, the configuration
+//     reads) — many existing deployments do grant those through "bucket/*",
+//     and breaking them is what got upstream's own attempt reverted.
+//
+// See github.com/minio/minio issue #20449.
+var sensitiveBucketMutationActions = map[Action]struct{}{
+	DeleteBucketAction:                     {},
+	ForceDeleteBucketAction:                {},
+	PutBucketPolicyAction:                  {},
+	DeleteBucketPolicyAction:               {},
+	PutReplicationConfigurationAction:      {},
+	PutBucketLifecycleAction:               {},
+	PutBucketObjectLockConfigurationAction: {},
+	PutBucketVersioningAction:              {},
+	PutBucketCorsAction:                    {},
+	DeleteBucketCorsAction:                 {},
+	PutBucketQOSAction:                     {},
+	PutInventoryConfigurationAction:        {},
+}
+
+// isSensitiveBucketMutation reports whether action is one of the bucket
+// configuration writes protected from object-only ("bucket/*") grants.
+func isSensitiveBucketMutation(action Action) bool {
+	_, ok := sensitiveBucketMutationActions[action]
+	return ok
+}
+
 // IsAllowed - checks given policy args is allowed to continue the Rest API.
 func (statement Statement) IsAllowed(args Args) bool {
 	return statement.IsAllowedPtr(&args)
@@ -60,13 +162,36 @@ func (statement Statement) IsAllowedPtr(args *Args) bool {
 		defer smallBufPool.Put(resource)
 		resource.Reset()
 		resource.WriteString(args.BucketName)
+		withheldBucketSlash := false
 		if args.ObjectName != "" {
 			if !strings.HasPrefix(args.ObjectName, "/") {
 				resource.WriteByte('/')
 			}
 			resource.WriteString(args.ObjectName)
-		} else {
+		} else if args.BucketName == "" {
+			// Preserve the "/" sentinel used by KMS two-phase authorization
+			// (empty bucket and empty object), which the isKMS() path below
+			// relies on.
 			resource.WriteByte('/')
+		} else if legacyBucketResourceMatch.Load() ||
+			statement.Effect != Allow ||
+			!isSensitiveBucketMutation(args.Action) {
+			// Append the trailing slash so an object resource pattern such as
+			// "bucket/*" keeps matching this bucket-level request. This is the
+			// historical behavior and is retained for every case except an
+			// Allow statement being evaluated for one of the sensitive
+			// bucket-level writes, where honoring "bucket/*" as a bucket-level
+			// grant is a privilege-escalation vector. Deny statements keep the
+			// slash too, so no Deny is ever weakened.
+			resource.WriteByte('/')
+		} else {
+			// Bucket-level Allow request for a sensitive bucket-level write,
+			// with the legacy shim off: the resource stays the bare bucket
+			// name, so an object-only pattern ("bucket/*") no longer
+			// authorizes it; bare-bucket and "*" patterns still match. The
+			// omission applies to the Resources grant only — remember it so
+			// the NotResources check below can restore the historical form.
+			withheldBucketSlash = true
 		}
 
 		if statement.isTable() && !TableAction(args.Action).IsValid() {
@@ -118,11 +243,38 @@ func (statement Statement) IsAllowedPtr(args *Args) bool {
 			}
 		}
 
-		// For some admin statements, resource match can be ignored.
-		ignoreResourceMatch := statement.isAdmin() || statement.isSTS()
+		// Admin actions that do not operate on a bucket resource
+		// skip resource matching entirely. For the small set of
+		// bucket-scoped admin actions (e.g. SetBucketQuota),
+		// resource matching is enforced when Resources are present.
+		ignoreResourceMatch := statement.isSTS() || (statement.isAdmin() && !statement.hasAdminResource())
 
 		if !ignoreResourceMatch && len(statement.Resources) > 0 && !statement.Resources.Match(resource.String(), args.ConditionValues) {
 			return false
+		}
+
+		if withheldBucketSlash {
+			// Restore the historical "bucket/" form. It is needed twice below,
+			// and in both cases for the same reason: this hardening must only
+			// ever remove a grant, never create one.
+			resource.WriteByte('/')
+
+			// The bare bucket name is a different string, so a pattern can
+			// match it that did not match "bucket/" — a fixed-width wildcard
+			// such as "mybucke?" matches "mybucket" but not "mybucket/".
+			// Honoring the bare form alone would therefore ADD a grant the
+			// historical matcher refused. Requiring both forms makes the
+			// protected path an intersection with the historical decision, so
+			// it is monotone by construction rather than by argument.
+			if !ignoreResourceMatch && len(statement.Resources) > 0 && !statement.Resources.Match(resource.String(), args.ConditionValues) {
+				return false
+			}
+
+			// NotResource is an exclusion: matching it against the bare bucket
+			// name would narrow the exclusion — and thereby broaden this Allow
+			// statement — for exactly the writes the hardening protects. The
+			// restored form below keeps every pre-existing
+			// "NotResource: bucket/*" exclusion at its full reach.
 		}
 
 		if !ignoreResourceMatch && len(statement.NotResources) > 0 && statement.NotResources.Match(resource.String(), args.ConditionValues) {
@@ -135,9 +287,57 @@ func (statement Statement) IsAllowedPtr(args *Args) bool {
 	return statement.Effect.IsAllowed(check())
 }
 
+// validateActionTypes rejects statements that mix actions from
+// different namespaces (e.g. s3 + admin, admin + sts). Each
+// statement must contain actions from exactly one namespace.
+func (statement Statement) validateActionTypes() error {
+	actions := statement.Actions
+	if len(actions) == 0 {
+		actions = statement.NotActions
+	}
+	var hasS3, hasAdmin, hasSTS, hasKMS, hasTable, hasVectors bool
+	for action := range actions {
+		switch {
+		case AdminAction(action).IsValid():
+			hasAdmin = true
+		case STSAction(action).IsValid():
+			hasSTS = true
+		case KMSAction(action).IsValid():
+			hasKMS = true
+		case TableAction(action).IsValid():
+			hasTable = true
+		case VectorsAction(action).IsValid():
+			hasVectors = true
+		default:
+			hasS3 = true
+		}
+	}
+	count := 0
+	for _, b := range []bool{hasS3, hasAdmin, hasSTS, hasKMS, hasTable, hasVectors} {
+		if b {
+			count++
+		}
+	}
+	if count > 1 {
+		return Errorf("mixing action types in the same statement is not allowed")
+	}
+	return nil
+}
+
 func (statement Statement) isAdmin() bool {
 	for action := range statement.Actions {
 		if AdminAction(action).IsValid() {
+			return true
+		}
+	}
+	return false
+}
+
+// hasAdminResource reports whether any action in this statement is a
+// bucket-scoped admin action (as declared by AdminActionsWithResource).
+func (statement Statement) hasAdminResource() bool {
+	for action := range statement.Actions {
+		if AdminAction(action).HasResource() {
 			return true
 		}
 	}
@@ -194,18 +394,12 @@ func (statement Statement) isValid() error {
 		return Errorf("Action and NotAction cannot be specified in the same statement")
 	}
 
+	if err := statement.validateActionTypes(); err != nil {
+		return err
+	}
+
 	if statement.isAdmin() {
-		if err := statement.Actions.ValidateAdmin(); err != nil {
-			return err
-		}
-		for action := range statement.Actions {
-			keys := statement.Conditions.Keys()
-			keyDiff := keys.Difference(adminActionConditionKeyMap[action])
-			if !keyDiff.IsEmpty() {
-				return Errorf("unsupported condition keys '%v' used for action '%v'", keyDiff, action)
-			}
-		}
-		return nil
+		return statement.validateAdmin(false)
 	}
 
 	if statement.isSTS() {
@@ -357,9 +551,84 @@ func (statement Statement) isValid() error {
 	return nil
 }
 
+// isValidStrict applies additional checks for new policies. It rejects
+// admin statements that specify both Resource and NotResource, enforces
+// that bucket-scoped admin actions have well-formed Resource ARNs, etc.
+// Servers call this path when creating or updating policies; the
+// permissive isValid path is used when loading existing policies.
+func (statement Statement) isValidStrict() error {
+	if !statement.Effect.IsValid() {
+		return Errorf("invalid Effect %v", statement.Effect)
+	}
+
+	if len(statement.Actions) == 0 && len(statement.NotActions) == 0 {
+		return Errorf("Action must not be empty")
+	}
+
+	if len(statement.Actions) > 0 && len(statement.NotActions) > 0 {
+		return Errorf("Action and NotAction cannot be specified in the same statement")
+	}
+
+	if err := statement.validateActionTypes(); err != nil {
+		return err
+	}
+	if err := statement.Resources.ValidateStrict(); err != nil {
+		return err
+	}
+	if err := statement.NotResources.ValidateStrict(); err != nil {
+		return err
+	}
+
+	if statement.isAdmin() {
+		return statement.validateAdmin(true)
+	}
+
+	// For non-admin types, delegate to the standard path which
+	// already enforces Resource/NotResource conflicts.
+	return statement.isValid()
+}
+
+// validateAdmin validates an admin statement. When strict is true,
+// Resource and NotResource in the same statement is rejected, and
+// Resources on bucket-scoped actions are validated as S3 ARNs.
+func (statement Statement) validateAdmin(strict bool) error {
+	if err := statement.Actions.ValidateAdmin(); err != nil {
+		return err
+	}
+	for action := range statement.Actions {
+		keys := statement.Conditions.Keys()
+		keyDiff := keys.Difference(adminActionConditionKeyMap[action])
+		if !keyDiff.IsEmpty() {
+			return Errorf("unsupported condition keys '%v' used for action '%v'", keyDiff, action)
+		}
+	}
+	if strict {
+		if len(statement.Resources) > 0 && len(statement.NotResources) > 0 {
+			return Errorf("Resource and NotResource cannot be specified in the same admin statement")
+		}
+		if len(statement.Resources) > 0 && statement.hasAdminResource() {
+			if err := statement.Resources.ValidateS3(); err != nil {
+				return err
+			}
+		}
+		if len(statement.NotResources) > 0 && statement.hasAdminResource() {
+			if err := statement.NotResources.ValidateS3(); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
 // Validate - validates Statement is for given bucket or not.
 func (statement Statement) Validate() error {
 	return statement.isValid()
+}
+
+// ValidateStrict validates the statement with strict rules suitable
+// for new policy creation. See isValidStrict for details.
+func (statement Statement) ValidateStrict() error {
+	return statement.isValidStrict()
 }
 
 // Equals checks if two statements are equal
@@ -460,6 +729,11 @@ func (statement Statement) hash(seed uint64) [16]byte {
 	xorInt(&h, len(statement.Resources), seed+5)
 	for res := range statement.Resources {
 		xorTo(&h, xxh3.HashString128Seed(res.Pattern+res.Type.String(), seed+6))
+	}
+
+	xorInt(&h, len(statement.NotResources), seed+9)
+	for res := range statement.NotResources {
+		xorTo(&h, xxh3.HashString128Seed(res.Pattern+res.Type.String(), seed+10))
 	}
 
 	xorInt(&h, len(statement.Conditions), seed+7)

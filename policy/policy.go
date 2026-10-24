@@ -28,7 +28,7 @@ import (
 	"sync"
 
 	"github.com/minio/minio-go/v7/pkg/set"
-	"github.com/minio/pkg/v3/wildcard"
+	"github.com/pgsty/silo-pkg/v3/wildcard"
 )
 
 // DefaultVersion - default policy version as per AWS S3 specification.
@@ -127,7 +127,16 @@ type Policy struct {
 
 // HasDenyStatement returns if the policy has a deny statement.
 func (iamp *Policy) HasDenyStatement() bool {
-	return iamp.hasDeny
+	if iamp.hasDeny {
+		return true
+	}
+	// Directly constructed policies have not populated the cached flag.
+	for i := range iamp.Statements {
+		if iamp.Statements[i].Effect == Deny {
+			return true
+		}
+	}
+	return false
 }
 
 // MatchResource matches resource with match resource patterns
@@ -160,9 +169,8 @@ func (iamp Policy) IsAllowedActions(bucketName, objectName string, conditionValu
 			ObjectName:      objectName,
 			Action:          admAction,
 			ConditionValues: conditionValues,
-			// checks mainly for actions that can have explicit
-			// deny, while without it are implicitly enabled.
-			DenyOnly: action == CreateServiceAccountAdminAction || action == CreateUserAdminAction,
+			// Match the server's implicit grants for self-service actions.
+			DenyOnly: action == CreateServiceAccountAdminAction || action == ChangeMyPasswordAdminAction,
 		}) {
 			actionSet.Add(admAction)
 		}
@@ -493,6 +501,23 @@ func (iamp Policy) Validate() error {
 	return iamp.isValid()
 }
 
+// ValidateStrict applies strict validation rules suitable for new
+// policy creation. It rejects policies that would be accepted by
+// Validate for backward compatibility but are invalid going forward
+// (e.g. admin statements with both Resource and NotResource).
+func (iamp Policy) ValidateStrict() error {
+	if iamp.Version != DefaultVersion && iamp.Version != "" {
+		return Errorf("invalid version '%v'", iamp.Version)
+	}
+
+	for _, statement := range iamp.Statements {
+		if err := statement.isValidStrict(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // updateActionIndex with latest statements()
 // maintains a reverse map of Action -> []Statements
 // for faster lookup and short-circuit.
@@ -531,6 +556,21 @@ func ParseConfig(reader io.Reader) (*Policy, error) {
 	}
 
 	return &iamp, iamp.Validate()
+}
+
+// ParseConfigStrict parses and validates with strict rules. Use this
+// when the server is creating or updating policies — it rejects
+// constructs that Validate allows for backward compatibility.
+func ParseConfigStrict(reader io.Reader) (*Policy, error) {
+	var iamp Policy
+
+	decoder := json.NewDecoder(reader)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&iamp); err != nil {
+		return nil, Errorf("%w", err)
+	}
+
+	return &iamp, iamp.ValidateStrict()
 }
 
 // Equals returns true if the two policies are identical
