@@ -1,5 +1,71 @@
 # Changelog
 
+## v3.16.1 — 2026-11-12
+
+- Reject non-object JSON inputs, trailing tokens, and unknown top-level,
+  statement, or principal fields in `policy.ParseConfigStrict` and
+  `policy.ParseBucketPolicyConfig` so custom `UnmarshalJSON` decoders cannot
+  turn misspelled fields into empty policies or drop statement conditions.
+- Require Go 1.27.4 and update the matching CI baseline.
+- Update x/sys, x/term, x/text and x/oauth2, grpc-gateway to v2.33.0,
+  gRPC to v1.85.0, and go-humanize to v1.1.0. Select the API definitions
+  required by grpc-gateway while retaining the existing RPC definitions.
+- Preserve the verified crypto and minio-go commits, terminal widths, and
+  the go-systemd v22.6.0 portability replacement.
+- This is a source-only module release. Server, Console and mcli must select
+  v3.16.1 and rebuild; this release does not publish their binaries or images.
+
+## v3.16.0 — 2026-11-08
+
+- Update go-jose/v4 from v4.1.6 to v4.1.9, including the five security fixes
+  in [v4.1.7](https://github.com/go-jose/go-jose/releases/tag/v4.1.7) and the
+  subsequent OpaqueSigner and unsupported-key error fixes. These are dependency
+  fixes; their applicability depends on the consuming application's use of JOSE.
+- Publish the networking dependency updates already on main: x/net v0.62.0 and
+  x/crypto `v0.58.1-0.20261009181718-2f1f834330b2`, replacing v0.61.0 and
+  v0.58.0 respectively.
+- Update cpuid/v2 to v2.4.2 to correct XSAVE/OSXSAVE feature detection, and
+  go.yaml.in/yaml/v3 to v3.0.6 to quote literal `<<` keys instead of emitting
+  ambiguous YAML merge keys. Cover configuration save/load with a regression test.
+- Clarify that the built-in infraAdmin policy includes batch-job administration.
+  Public package APIs, policy formats and authorization decisions remain compatible.
+- Retain Go 1.27.3, the existing upstream minio-go commit `320af050c445`,
+  go-humanize v1.0.1, go-runewidth v0.0.29, and the go-systemd v22.6.0
+  compatibility replacement. Consumers must retain their own required replacements.
+- This is a source-only module release. Server, Console and mcli must select
+  v3.16.0 and rebuild; this release does not publish their binaries or images.
+
+## v3.15.2 — 2026-10-26
+
+- Update upstream minio-go to `v7.4.2-0.20261025165926-320af050c445`.
+  Removing bucket replication now accepts HTTP 204 as well as HTTP 200,
+  including an empty configuration passed to SetBucketReplication. Other
+  responses still return their original error. Upstream has not tagged v7.4.2.
+- Keep Go 1.27.3, public APIs, policy semantics, and the verified output and
+  NetBSD compatibility selections. This is a protocol-correctness update,
+  with no newly claimed CVE fix.
+- Consumers must adopt v3.15.2 and rebuild; this source-only module release
+  does not update installed mcli, Console or SILO binaries.
+
+## v3.15.1 — 2026-10-25
+
+[GitHub release](https://github.com/pgsty/silo-pkg/releases/tag/v3.15.1) ·
+[Changes since v3.15.0](https://github.com/pgsty/silo-pkg/compare/v3.15.0...v3.15.1)
+
+- Update upstream minio-go from v7.4.1 to
+  `v7.4.2-0.20261020194015-ab93db7ba435`. This exact upstream commit includes
+  six fixes after v7.4.1; upstream has not published a v7.4.2 tag.
+- Reject short streamed multipart uploads before sending the incomplete part,
+  including parallel streams. Preserve sequential reads after `ReadAt` reaches
+  EOF, reject negative `ReadAt` offsets before fetching metadata, and preserve
+  read/seek bounds after `Stat`. Report each failed `RemoveObjects` object once.
+- Retain Go 1.27.3, public package APIs, policy semantics and the v3.14.3 policy
+  optimizations. Other declared dependencies are current except the deliberate
+  go-humanize v1.0.1, go-runewidth v0.0.29 and go-systemd v22.6.0 compatibility
+  selections. This release does not add a new CVE fix.
+- This is a source-only module release. Consumers must adopt v3.15.1 and rebuild
+  to receive the SDK fixes; SILO, Console and mcli publish independently.
+
 ## v3.15.0 — 2026-10-24
 
 [GitHub release](https://github.com/pgsty/silo-pkg/releases/tag/v3.15.0) ·
